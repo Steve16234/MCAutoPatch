@@ -27,6 +27,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -105,14 +107,17 @@ def _generate_keystore() -> None:
 
 
 def _upload_secret_gh(name: str, value: str) -> bool:
+    """Upload a GitHub Actions secret without ever printing its value."""
     if not shutil.which("gh"):
         log("[!] 未找到 gh CLI，无法自动上传 Secret")
         return False
+
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     pat = os.environ.get("GH_PAT", "").strip()
     if not repo or not pat:
         log("[!] 缺少 GITHUB_REPOSITORY 或 GH_PAT")
         return False
+
     try:
         subprocess.run(
             ["gh", "secret", "set", name, "-R", repo, "-b", value],
@@ -129,24 +134,34 @@ def ensure_keystore() -> None:
     if KEYSTORE.exists():
         log(f"[*] 使用已有 keystore: {KEYSTORE}")
         return
+
     b64 = os.environ.get("KEYSTORE_B64", "").strip()
     if b64:
         log("[*] 从环境变量 KEYSTORE_B64 解码 keystore")
+        tmp = KEYSTORE.with_suffix(KEYSTORE.suffix + ".tmp")
         try:
-            KEYSTORE.write_bytes(base64.b64decode(b64))
+            raw = base64.b64decode(b64, validate=True)
+            if not raw:
+                raise ValueError("内容为空")
+            tmp.write_bytes(raw)
+            tmp.replace(KEYSTORE)
         except Exception as e:
-            raise RuntimeError(f"KEYSTORE_B64 解码失败: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError(f"KEYSTORE_B64 解码失败: {e}") from e
+        log(f"[√] keystore 已恢复: {KEYSTORE}")
         return
+
     _generate_keystore()
-    b64 = base64.b64encode(KEYSTORE.read_bytes()).decode()
+    b64 = base64.b64encode(KEYSTORE.read_bytes()).decode("ascii")
     log("[*] 尝试把 keystore 上传到 GitHub Secret KEYSTORE_B64 ...")
     if _upload_secret_gh("KEYSTORE_B64", b64):
         log("[√] 已上传到 Secret KEYSTORE_B64")
     else:
-        log("[!] 上传失败！请手动把下面的 base64 存到 Secret KEYSTORE_B64：")
-        log("=" * 60)
-        log(b64)
-        log("=" * 60)
+        # Never print the private keystore material into CI logs.
+        log("[!] 自动上传 KEYSTORE_B64 失败；请通过 GitHub Secret 安全保存该 keystore。")
 
 
 # --------------------------------------------------------------------------- #
@@ -338,30 +353,75 @@ def resolve_download_url(share_url: str) -> str:
 # --------------------------------------------------------------------------- #
 # 流式下载
 # --------------------------------------------------------------------------- #
-def download_file(url: str, dest: Path, chunk: int = 1 << 20) -> str:
+def _safe_filename(name: str, fallback: str) -> str:
+    name = name.strip().replace("\\", "/")
+    name = Path(name).name
+    if not name or name in {".", ".."}:
+        return fallback
+    # Avoid control characters and characters that are awkward in CI artifacts.
+    name = re.sub(r"[\x00-\x1f\x7f]", "_", name)
+    return name
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    chunk: int = 1 << 20,
+    validate_zip: bool = False,
+) -> str:
     log(f"[*] 下载: {url[:120]}...")
-    with requests.get(url, headers=HTTP_HEADERS, stream=True, timeout=600) as r:
-        r.raise_for_status()
-        orig_name = dest.name
-        cd = r.headers.get("content-disposition", "")
-        m = re.search(r"filename\*?=(?:UTF-8''|\"?)([^\";]+)", cd, re.I)
-        if m:
-            orig_name = unquote(m.group(1).strip().strip('"'))
-            log(f"[*] 服务端文件名: {orig_name}")
-        total = int(r.headers.get("content-length", 0))
-        log(f"[*] 文件大小: {total/1024/1024:.2f} MB" if total else "[*] 文件大小未知")
-        done = 0
-        with open(dest, "wb") as f:
-            for buf in r.iter_content(chunk_size=chunk):
-                if not buf:
-                    continue
-                f.write(buf)
-                done += len(buf)
-                if total and done % (100 << 20) < chunk:
-                    pct = done * 100 // total
-                    log(f"    进度: {pct}% ({done/1024/1024:.1f}/{total/1024/1024:.1f} MB)")
-    log(f"[*] 下载完成，共 {dest.stat().st_size/1024/1024:.2f} MB")
-    return orig_name
+    part = dest.with_name(dest.name + ".part")
+    orig_name = dest.name
+
+    try:
+        with requests.get(url, headers=HTTP_HEADERS, stream=True, timeout=600) as r:
+            r.raise_for_status()
+
+            cd = r.headers.get("content-disposition", "")
+            m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.I)
+            if m:
+                orig_name = unquote(m.group(1).strip().strip('"'))
+            else:
+                m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.I)
+                if not m:
+                    m = re.search(r"filename\s*=\s*([^;]+)", cd, re.I)
+                if m:
+                    orig_name = unquote(m.group(1).strip().strip('"'))
+
+            orig_name = _safe_filename(orig_name, dest.name)
+            if orig_name != dest.name:
+                log(f"[*] 服务端文件名: {orig_name}")
+
+            total = int(r.headers.get("content-length", 0) or 0)
+            log(f"[*] 文件大小: {total/1024/1024:.2f} MB" if total else "[*] 文件大小未知")
+
+            done = 0
+            part.parent.mkdir(parents=True, exist_ok=True)
+            with open(part, "wb") as f:
+                for buf in r.iter_content(chunk_size=chunk):
+                    if not buf:
+                        continue
+                    f.write(buf)
+                    done += len(buf)
+                    if total and done % (100 << 20) < chunk:
+                        pct = done * 100 // total
+                        log(f"    进度: {pct}% ({done/1024/1024:.1f}/{total/1024/1024:.1f} MB)")
+
+            if total and done != total:
+                raise RuntimeError(f"下载大小不一致: HTTP={total} 实际={done}")
+
+        if validate_zip and not zipfile.is_zipfile(part):
+            raise RuntimeError(f"下载文件不是有效 ZIP/APK: {part}")
+
+        part.replace(dest)
+        log(f"[*] 下载完成，共 {dest.stat().st_size/1024/1024:.2f} MB")
+        return orig_name
+    except Exception:
+        try:
+            part.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +437,70 @@ def _check_apktool() -> None:
         pass
 
 
+def _prepare_aapt2() -> str:
+    """Copy a working aapt2 into the build workspace.
+
+    Apktool 2.11.x accepts either --use-aapt2 or --aapt, never both.
+    We deliberately use --aapt with a private executable copy so Apktool
+    does not need to chmod the Android SDK's read-only/system-owned binary.
+    """
+    source: str | None = shutil.which("aapt2")
+
+    if source:
+        source_path = Path(source).resolve()
+    else:
+        source_path = None
+        for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            sdk = os.environ.get(env, "").strip()
+            if not sdk:
+                continue
+            sdk_path = Path(sdk)
+            if not sdk_path.is_dir():
+                continue
+            candidates = [
+                p for p in sdk_path.glob("build-tools/*/aapt2")
+                if p.is_file()
+            ]
+            if candidates:
+                candidates.sort(key=lambda p: p.parent.name, reverse=True)
+                source_path = candidates[0].resolve()
+                break
+
+    if source_path is None or not source_path.is_file():
+        raise RuntimeError("找不到 aapt2，请安装 Android SDK Build Tools")
+
+    if not os.access(source_path, os.R_OK):
+        raise RuntimeError(f"aapt2 无法读取: {source_path}")
+
+    local_dir = WORK_DIR / "_tools"
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_aapt2 = local_dir / "aapt2"
+
+    # shutil.copyfile avoids propagating broken/readonly source permissions.
+    shutil.copyfile(source_path, local_aapt2)
+    os.chmod(local_aapt2, 0o755)
+
+    if not os.access(local_aapt2, os.X_OK):
+        raise RuntimeError(f"aapt2 副本不可执行: {local_aapt2}")
+
+    try:
+        result = subprocess.run(
+            [str(local_aapt2), "version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+    except Exception as e:
+        raise RuntimeError(f"aapt2 无法执行: {local_aapt2}: {e}") from e
+
+    version = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "unknown")
+    log(f"[*] 使用 aapt2: {local_aapt2}")
+    log(f"[*] aapt2 版本: {version}")
+    return str(local_aapt2)
+
+
 def extract_with_apktool(apk: Path, out_dir: Path) -> None:
     log(f"[*] apktool 解包 -> {out_dir}")
     if out_dir.exists():
@@ -389,16 +513,29 @@ def extract_with_apktool(apk: Path, out_dir: Path) -> None:
 
 
 def repack_with_apktool(src_dir: Path, out_apk: Path) -> None:
-    """
-    使用 apktool b --use-aapt2。
-    aapt2 由 workflow 里的 build-tools 提供，并已加到 PATH 和 /usr/local/bin/aapt2。
+    """Build with Apktool using a private aapt2 copy.
+
+    IMPORTANT: --aapt and --use-aapt2 are mutually exclusive in Apktool 2.11.x.
     """
     log(f"[*] apktool 打包 -> {out_apk}")
     if out_apk.exists():
         out_apk.unlink()
-    cmd = ["apktool", "b", "--use-aapt2", str(src_dir), "-o", str(out_apk)]
+
+    aapt2 = _prepare_aapt2()
+    cmd = [
+        "apktool",
+        "b",
+        "--aapt", aapt2,
+        str(src_dir),
+        "-o", str(out_apk),
+    ]
     log(f"[*] 执行: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
+
+    if not out_apk.is_file() or out_apk.stat().st_size == 0:
+        raise RuntimeError(f"apktool 未生成有效 APK: {out_apk}")
+    if not zipfile.is_zipfile(out_apk):
+        raise RuntimeError(f"apktool 生成的文件不是有效 APK/ZIP: {out_apk}")
 
 
 # --------------------------------------------------------------------------- #
@@ -412,78 +549,195 @@ def find_main_activity(unpack_dir: Path) -> Path | None:
     return None
 
 
+def _parameter_register_count(method_line: str) -> int:
+    """Return Dalvik register width used by method parameters, including this."""
+    if not method_line.startswith(".method"):
+        raise ValueError(f"不是 method 声明: {method_line}")
+
+    descriptor_match = re.search(r"\((.*?)\)[VZBSCIJFDL\[;]", method_line)
+    if not descriptor_match:
+        # Fallback for unusual/obfuscated declarations; this is deliberately
+        # conservative because a wrong parameter count makes .registers unsafe.
+        raise ValueError(f"无法解析方法参数: {method_line}")
+
+    params = descriptor_match.group(1)
+    count = 0
+    i = 0
+    while i < len(params):
+        c = params[i]
+        if c in "ZBSCIJFD":
+            count += 2 if c in "JD" else 1
+            i += 1
+        elif c == "L":
+            j = params.find(";", i)
+            if j < 0:
+                raise ValueError(f"非法对象参数描述符: {method_line}")
+            count += 1
+            i = j + 1
+        elif c == "[":
+            i += 1
+            while i < len(params) and params[i] == "[":
+                i += 1
+            if i >= len(params):
+                raise ValueError(f"非法数组参数描述符: {method_line}")
+            if params[i] == "L":
+                j = params.find(";", i)
+                if j < 0:
+                    raise ValueError(f"非法数组对象参数描述符: {method_line}")
+                i = j + 1
+            else:
+                i += 1
+            count += 1
+        else:
+            raise ValueError(f"未知参数描述符 {c!r}: {method_line}")
+
+    # Non-static instance methods have the implicit 'this' parameter.
+    if not re.search(r"\.method\s+.*\bstatic\b", method_line):
+        count += 1
+    return count
+
+
 def patch_main_activity(smali_path: Path) -> bool:
     log(f"[*] 修改 smali: {smali_path}")
     text = smali_path.read_text(encoding="utf-8")
     lines = text.splitlines()
 
+    # Do not inject twice when rebuilding an already-patched APK.
+    if 'System;->loadLibrary(Ljava/lang/String;)V' in text and '"mtbinloader2"' in text:
+        log('[=] 已存在 System.loadLibrary("mtbinloader2")，跳过重复注入')
+        return True
+
     out: list[str] = []
-    in_oncreate = False
+    in_target = False
     handled = False
+    current_method_line = ""
 
     for line in lines:
         stripped = line.strip()
-        indent = line[: len(line) - len(line.lstrip())]
 
-        if not in_oncreate and stripped.startswith(".method"):
-            if "onCreate(" in stripped and "public" in stripped:
-                in_oncreate = True
-                out.append(line)
-                continue
+        if not in_target and stripped.startswith(".method"):
+            # Exact method name/signature; do not require 'public'.
+            if re.search(r"\bonCreate\(Landroid/os/Bundle;\)V\b", stripped):
+                in_target = True
+                current_method_line = stripped
+            out.append(line)
+            continue
 
-        if in_oncreate and not handled:
-            m = re.match(r"\.locals\s+(\d+)", stripped)
+        if in_target and not handled:
+            m = re.match(r"\.locals\s+(\d+)$", stripped)
             if m:
                 n = int(m.group(1))
-                new_regs = n + 4
-                log(f"[*] .locals {n} -> .registers {new_regs}")
-                out.append(f"{indent}.registers {new_regs}")
-                out.extend(INJECT_CODE)
+                temp_reg = f"v{n}"
+                out.append(line.replace(f".locals {n}", f".locals {n + 1}", 1))
+                out.append(f'    const-string {temp_reg}, "mtbinloader2"')
+                out.append(
+                    f"    invoke-static {{{temp_reg}}}, "
+                    "Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V"
+                )
                 handled = True
+                log(f"[*] .locals {n} -> .locals {n + 1}，使用临时寄存器 {temp_reg}")
                 continue
 
-            m2 = re.match(r"\.registers\s+(\d+)", stripped)
-            if m2:
-                n = int(m2.group(1))
-                if n < 6:
-                    log(f"[*] .registers {n} -> .registers 6")
-                    out.append(f"{indent}.registers 6")
-                else:
-                    out.append(line)
-                out.extend(INJECT_CODE)
+            m = re.match(r"\.registers\s+(\d+)$", stripped)
+            if m:
+                total = int(m.group(1))
+                param_regs = _parameter_register_count(current_method_line)
+                locals_count = total - param_regs
+                if locals_count < 0:
+                    raise RuntimeError(
+                        f"非法寄存器布局: .registers {total}, 参数需要 {param_regs}: {smali_path}"
+                    )
+                temp_reg = f"v{locals_count}"
+                out.append(line.replace(f".registers {total}", f".registers {total + 1}", 1))
+                out.append(f'    const-string {temp_reg}, "mtbinloader2"')
+                out.append(
+                    f"    invoke-static {{{temp_reg}}}, "
+                    "Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V"
+                )
                 handled = True
+                log(
+                    f"[*] .registers {total} -> .registers {total + 1}，"
+                    f"参数寄存器={param_regs}，使用临时寄存器 {temp_reg}"
+                )
                 continue
 
         out.append(line)
 
-        if in_oncreate and stripped == ".end method":
-            in_oncreate = False
+        if in_target and stripped == ".end method":
+            in_target = False
 
-    if handled:
-        smali_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-        log('[√] 已注入 System.loadLibrary("mtbinloader2")')
-    else:
-        log("[!] 未在 MainActivity 的 onCreate 中找到 .locals / .registers")
-    return handled
+    if not handled:
+        if in_target:
+            raise RuntimeError(f"找到 onCreate 但没有找到 .locals/.registers: {smali_path}")
+        log("[!] 未找到目标 onCreate(Landroid/os/Bundle;)V")
+        return False
+
+    smali_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    log('[√] 已注入 System.loadLibrary("mtbinloader2")')
+    return True
 
 
 # --------------------------------------------------------------------------- #
 # 注入 .so
 # --------------------------------------------------------------------------- #
-def inject_so_files(so_dir: Path, unpack_dir: Path) -> int:
+def _android_abi(abi: str) -> str:
+    if abi == "ARMv7":
+        return "armeabi-v7a"
+    if abi == "ARMv8":
+        return "arm64-v8a"
+    raise ValueError(f"未知 ABI: {abi}")
+
+
+def _default_so_name(name: str) -> str:
+    """Normalize mtbinloader2 release asset names to the JNI loadLibrary name."""
+    if name == "libmtbinloader2.so":
+        return name
+    if name.startswith("libmtbinloader2_") and name.endswith(".so"):
+        return "libmtbinloader2.so"
+    if name.startswith("libmtbinloader2-") and name.endswith(".so"):
+        return "libmtbinloader2.so"
+    return name
+
+
+def _safe_relative_path(path_text: str) -> Path:
+    rel = Path(path_text)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise RuntimeError(f"非法相对路径: {path_text}")
+    return rel
+
+
+def inject_so_files(so_dir: Path, unpack_dir: Path, abi: str) -> int:
     if not so_dir.exists() or not so_dir.is_dir():
-        log(f"[!] 未找到 so 注入目录: {so_dir}，跳过 so 注入")
+        log(f"[!] 未找到 so 注入目录: {so_dir}")
         return 0
-    log(f"[*] 从 {so_dir} 注入 .so 文件")
+
+    log(f"[*] 从 {so_dir} 注入 .so 文件 (ABI={abi})")
+    so_map = _load_so_map()
+    android_abi = _android_abi(abi)
     count = 0
+
     for src in sorted(so_dir.rglob("*.so")):
-        rel = src.relative_to(so_dir)
+        name = src.name
+        mapped = so_map.get(abi, {}).get(name)
+
+        if mapped:
+            rel = _safe_relative_path(mapped)
+            # A mapping that is only a filename still goes under the Android ABI dir.
+            if len(rel.parts) == 1:
+                rel = Path("lib") / android_abi / rel
+        else:
+            rel = Path("lib") / android_abi / _default_so_name(name)
+
         dst = unpack_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
         count += 1
-        log(f"[so] 注入 {rel}")
-    log(f"[so] 共注入 {count} 个文件")
+        log(f"[so] 注入 {src.name} -> {rel}")
+
+    if count == 0:
+        log(f"[!] {so_dir} 中没有可注入的 .so 文件")
+    else:
+        log(f"[so] 共注入 {count} 个文件")
     return count
 
 
@@ -494,71 +748,105 @@ def find_tool(name: str):
     p = shutil.which(name)
     if p:
         return p
+
+    candidates: list[Path] = []
     for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
-        home = os.environ.get(env)
+        home = os.environ.get(env, "").strip()
         if not home:
             continue
-        base = Path(home)
-        if not base.exists():
+        build_tools = Path(home) / "build-tools"
+        if not build_tools.is_dir():
             continue
-        for cand in base.rglob(name):
-            if cand.is_file():
-                return str(cand)
+        candidates.extend(
+            p for p in build_tools.glob(f"*/{name}")
+            if p.is_file()
+        )
+
+    if candidates:
+        candidates.sort(key=lambda p: p.parent.name, reverse=True)
+        return str(candidates[0])
+
     return None
 
 
 def zipalign_apk(src: Path, dst: Path) -> None:
     tool = find_tool("zipalign")
     if not tool:
-        log("[!] 未找到 zipalign，跳过对齐")
-        shutil.copy(src, dst)
-        return
-    log("[*] zipalign 对齐 (4 字节)")
+        raise RuntimeError("找不到 zipalign")
+    if dst.exists():
+        dst.unlink()
+    log(f"[*] zipalign: {tool}")
     subprocess.run([tool, "-f", "-p", "4", str(src), str(dst)], check=True)
+    if not dst.is_file():
+        raise RuntimeError(f"zipalign 没有生成文件: {dst}")
 
 
 def sign_apk(src: Path, dst: Path) -> None:
     if not KEYSTORE.exists():
         raise FileNotFoundError(f"找不到签名证书: {KEYSTORE}")
+
     apksigner = find_tool("apksigner")
-    if apksigner:
-        log("[*] 使用 apksigner 签名 (v1 + v2)")
-        subprocess.run(
-            [
-                apksigner, "sign",
-                "--ks", str(KEYSTORE),
-                "--ks-pass", f"pass:{KS_PASS}",
-                "--key-pass", f"pass:{KEY_PASS}",
-                "--ks-key-alias", KEY_ALIAS,
-                "--v1-signing-enabled", "true",
-                "--v2-signing-enabled", "true",
-                "--out", str(dst),
-                str(src),
-            ],
-            check=True,
-        )
-        return
-    log("[!] 未找到 apksigner，回退到 jarsigner")
-    shutil.copy(src, dst)
+    if not apksigner:
+        raise RuntimeError("找不到 apksigner，拒绝回退 jarsigner（无法保证 APK v2 签名）")
+
+    if dst.exists():
+        dst.unlink()
+
+    log(f"[*] 使用 apksigner 签名 (v1 + v2): {apksigner}")
     subprocess.run(
         [
-            "jarsigner", "-sigalg", "SHA256withRSA", "-digestalg", "SHA-256",
-            "-keystore", str(KEYSTORE),
-            "-storepass", KS_PASS,
-            "-keypass", KEY_PASS,
-            str(dst), KEY_ALIAS,
+            apksigner, "sign",
+            "--ks", str(KEYSTORE),
+            "--ks-pass", f"pass:{KS_PASS}",
+            "--key-pass", f"pass:{KEY_PASS}",
+            "--ks-key-alias", KEY_ALIAS,
+            "--v1-signing-enabled", "true",
+            "--v2-signing-enabled", "true",
+            "--out", str(dst),
+            str(src),
         ],
         check=True,
     )
+
+    verify = subprocess.run(
+        [apksigner, "verify", "--verbose", str(dst)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    log("[*] apksigner verify:")
+    for line in verify.stdout.splitlines():
+        log(f"    {line}")
+
+    if verify.returncode != 0:
+        raise RuntimeError(f"apksigner verify 失败: {dst}")
+
+    verify_text = verify.stdout
+    v2_match = re.search(
+        r"Verified using v2 scheme .*?:\s*(true|false)",
+        verify_text,
+        re.I,
+    )
+    if v2_match and v2_match.group(1).lower() != "true":
+        raise RuntimeError(f"APK 未通过 v2 签名验证: {dst}")
+
+    if not dst.is_file() or dst.stat().st_size == 0:
+        raise RuntimeError(f"签名后 APK 无效: {dst}")
 
 
 # --------------------------------------------------------------------------- #
 # 单架构构建
 # --------------------------------------------------------------------------- #
-def build_one(abi: str, share_url: str, version: str,
-              channel: str, out_dir: Path) -> Path:
+def build_one(
+    abi: str,
+    share_url: str,
+    version: str,
+    channel: str,
+    out_dir: Path,
+) -> Path:
     log("=" * 60)
-    log(f"[*] 构建 channel={channel} abi={abi}")
+    log(f"[*] 构建 channel={channel} abi={abi} version={version}")
 
     abi_work = WORK_DIR / channel / abi
     if abi_work.exists():
@@ -570,7 +858,7 @@ def build_one(abi: str, share_url: str, version: str,
 
     # 2. 下载 APK
     original_apk = abi_work / "original.apk"
-    orig_name = download_file(real_url, original_apk)
+    orig_name = download_file(real_url, original_apk, validate_zip=True)
 
     stem = Path(orig_name).stem
     if stem.lower().endswith("_patch"):
@@ -583,25 +871,28 @@ def build_one(abi: str, share_url: str, version: str,
     unpack_dir = abi_work / "unpack"
     extract_with_apktool(original_apk, unpack_dir)
 
-    # 4. 修改 MainActivity.smali
+    # 4. 修改 MainActivity.smali；失败直接停止，禁止生成假成功 APK
     main_activity = find_main_activity(unpack_dir)
-    if main_activity:
-        patch_main_activity(main_activity)
-    else:
-        log(f"[!] 未找到 {MAIN_ACTIVITY_REL}，跳过 smali 修改")
+    if not main_activity:
+        raise RuntimeError(f"未找到 {MAIN_ACTIVITY_REL}")
+    if not patch_main_activity(main_activity):
+        raise RuntimeError(f"MainActivity patch 失败: {main_activity}")
 
-    # 5. 注入 .so
+    # 5. 注入正确 Android ABI 路径和库名
     abi_so_dir = SO_PATCH_DIR / abi
     if abi_so_dir.exists():
-        inject_so_files(abi_so_dir, unpack_dir)
+        injected = inject_so_files(abi_so_dir, unpack_dir, abi)
     else:
-        inject_so_files(SO_PATCH_DIR, unpack_dir)
+        injected = inject_so_files(SO_PATCH_DIR, unpack_dir, abi)
 
-    # 6. apktool 打包
+    if injected <= 0:
+        raise RuntimeError(f"没有注入任何 .so: {abi}")
+
+    # 6. apktool 打包 (唯一使用 --aapt，不再与 --use-aapt2 冲突)
     rebuilt_apk = abi_work / "rebuilt.apk"
     repack_with_apktool(unpack_dir, rebuilt_apk)
 
-    # 7. zipalign + 签名
+    # 7. zipalign + 签名 + 验证
     aligned_apk = abi_work / "aligned.apk"
     zipalign_apk(rebuilt_apk, aligned_apk)
 
@@ -610,9 +901,13 @@ def build_one(abi: str, share_url: str, version: str,
     sign_apk(aligned_apk, out_apk)
 
     size_mb = out_apk.stat().st_size / 1024 / 1024
-    sha256 = hashlib.sha256(out_apk.read_bytes()).hexdigest()
+    sha256 = hashlib.sha256()
+    with open(out_apk, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            sha256.update(chunk)
+
     log(f"[√] {channel}/{abi} 构建完成: {out_apk}  ({size_mb:.2f} MB)")
-    log(f"    SHA256: {sha256}")
+    log(f"    SHA256: {sha256.hexdigest()}")
     return out_apk
 
 
@@ -634,7 +929,6 @@ def main() -> int:
         log(f"[x] {e}")
         return 1
 
-    # 状态
     state = load_state()
     local_so = state.get("so_tag", "")
     local_apks = state.get("apk_versions", {})
@@ -644,8 +938,12 @@ def main() -> int:
     try:
         so_info = fetch_so_release_info()
         remote_so = so_info["tag"]
+        if SO_REPO and (not so_info.get("matched") or not so_info.get("assets")):
+            raise RuntimeError("SO_REPO 已配置，但最新 release 没有可用 .so asset")
     except Exception as e:
         log(f"[!] 获取 so release 失败: {e}")
+        if SO_REPO:
+            return 1
         so_info = {"tag": "", "assets": [], "matched": False}
         remote_so = ""
 
@@ -655,35 +953,45 @@ def main() -> int:
         and bool(so_info["assets"])
     )
 
-    # 逐个 channel 获取版本并比对
     jobs = []
+    had_version_error = False
     for ch in CHANNELS:
         try:
             info = fetch_version_info(ch["b"])
             parsed = parse_version_info(info)
         except Exception as e:
             log(f"[!] {ch['label']} 获取版本失败: {e}")
+            had_version_error = True
             continue
 
         remote_apk = str(parsed.get("version_all") or parsed["version"])
         local_apk = local_apks.get(ch["name"], "")
         apk_changed = remote_apk != local_apk
 
-        log(f"[*] {ch['label']}({ch['name']}): 远程={remote_apk} "
+        log(
+            f"[*] {ch['label']}({ch['name']}): 远程={remote_apk} "
             f"本地={local_apk or '(空)'} "
-            f"{'变化' if apk_changed else '未变'}")
+            f"{'变化' if apk_changed else '未变'}"
+        )
 
         if apk_changed or so_changed:
-            jobs.append({
-                "channel": ch,
-                "remote_apk": remote_apk,
-                "links": parsed["links"],
-            })
+            jobs.append(
+                {
+                    "channel": ch,
+                    "remote_apk": remote_apk,
+                    "links": parsed["links"],
+                }
+            )
 
-    log(f"[*] SO: 远程={remote_so or '(无)'} 本地={local_so or '(空)'} "
-        f"{'变化' if so_changed else '未变'}")
+    log(
+        f"[*] SO: 远程={remote_so or '(无)'} 本地={local_so or '(空)'} "
+        f"{'变化' if so_changed else '未变'}"
+    )
 
     if not jobs:
+        if had_version_error:
+            log("[x] 存在版本接口错误，不返回成功")
+            return 1
         log("[=] 所有 channel 均无更新，退出")
         return 0
 
@@ -692,18 +1000,23 @@ def main() -> int:
         if SO_PATCH_DIR.exists():
             shutil.rmtree(SO_PATCH_DIR)
         SO_PATCH_DIR.mkdir(parents=True, exist_ok=True)
-        download_so_assets(so_info["assets"], SO_PATCH_DIR)
+        count = download_so_assets(so_info["assets"], SO_PATCH_DIR)
+        if count <= 0:
+            log("[x] release 没有下载到任何 .so")
+            return 1
+    elif SO_PATCH_DIR.exists():
+        log(f"[*] 复用现有 so_patch（tag={remote_so or local_so or '(local)'}）")
     else:
-        log(f"[*] 复用现有 so_patch（tag={remote_so}）")
+        log("[x] 没有可用 so_patch")
+        return 1
 
     # 工作目录
     if WORK_DIR.exists():
         shutil.rmtree(WORK_DIR)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 逐 channel 逐 ABI 构建
     results: dict[str, list[Path]] = {}
-    all_ok = True
+    all_ok = not had_version_error
 
     for job in jobs:
         ch = job["channel"]
@@ -735,7 +1048,7 @@ def main() -> int:
         log("[x] 没有任何产物生成")
         return 1
 
-    # 记录状态（全部成功才写）
+    # 只有全部 requested jobs 成功才更新 state，避免跳过失败重试。
     if all_ok:
         new_apks = dict(local_apks)
         for job in jobs:
@@ -745,7 +1058,6 @@ def main() -> int:
     else:
         log("[!] 存在失败项，不记录状态，下次将重试")
 
-    # 汇总
     log("=" * 60)
     total = 0
     for ch_name, outs in results.items():
@@ -758,7 +1070,7 @@ def main() -> int:
     log(f"[√] 全部完成，共 {total} 个产物")
     log("=" * 60)
 
-    # 输出给 Actions
+    # Outputs for GitHub Actions
     gho = os.environ.get("GITHUB_OUTPUT")
     if gho:
         with open(gho, "a", encoding="utf-8") as f:
@@ -773,7 +1085,8 @@ def main() -> int:
                 for p in outs:
                     f.write(f"{p}\n")
                 f.write("EOF\n")
-    return 0
+
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":
