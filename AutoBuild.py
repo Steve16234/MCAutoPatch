@@ -1,41 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APK 自动构建脚本（GitHub Actions）
+MC 自动补丁构建脚本（GitHub Actions）
+
+同时构建 正式版(stable, b=0) 和 测试版(beta, b=1)。
 
 流程:
-    1. 确保签名证书存在:
-       - 本地 release.keystore 文件
-       - 环境变量 KEYSTORE_B64（Actions 从 Secret 注入）
-       - 都没有 -> 自动生成 + 用 GH_PAT 上传到 Secret KEYSTORE_B64
-    2. 读取本地 state.json（记录上次的 apk_version 和 so_tag）
-    3. POST https://api.mcarc.top/last_version 获取 APK 远程版本（bbk 版本）
-    4. GET  https://api.github.com/repos/<SO_REPO>/releases/latest 获取 SO release
-    5. 用 bbk 的 version / version_all 生成前缀，匹配 release，命中才下载 so
-    6. APK 与 SO 任一变化才继续
-    7. 下载 .so 到 so_patch/<ABI>/
-    8. 解析分享链接 -> openlist -> 真实直链 -> 下载 APK
-    9. apktool 解包 -> 修改 MainActivity.smali -> 注入 so -> apktool 打包
-   10. zipalign + apksigner 重新签名
-   11. 输出到 dist/，更新 state.json
-
-环境变量:
-    KEYSTORE_B64        可选，keystore 的 base64（Actions 从 Secret 注入）
-    KEYSTORE_PASSWORD   keystore 密码（默认 android）
-    KEY_ALIAS           别名（默认 release）
-    KEY_PASSWORD        key 密码（默认 android）
-    GH_PAT              可选，用于首次自动上传 Secret KEYSTORE_B64
-    GITHUB_REPOSITORY   Actions 自动提供，格式 owner/repo
-    SO_REPO             so 源仓库，"owner/repo"
-    SO_RELEASE          默认 "latest"
-    SO_TOKEN            可选，私有 so 仓库时用
-    KEYSTORE_PATH       默认 release.keystore
-    SO_PATCH_DIR        默认 so_patch
-
-依赖:
-    pip install requests
-    系统需要 apktool、keytool、Android build-tools（zipalign、apksigner）
-    可选：gh CLI（用于自动上传 Secret）
+    1. 确保签名证书存在
+    2. 读取本地 state.json（记录每个 channel 的 apk_version 和共用的 so_tag）
+    3. 对每个 channel 获取 bbk 远程版本（b=0/1）
+    4. 获取 so 最新 release（总是取最新）
+    5. 任一 channel 的 APK 版本变化 或 so tag 变化 -> 该 channel 需要构建
+    6. 下载 so 到 so_patch/<ABI>/（tag 变化时重下）
+    7. 解析分享链接 -> 下载 APK（保留原始文件名）
+    8. apktool 解包 -> 修改 MainActivity.smali -> 注入 so
+    9. apktool b --use-aapt2 重打包
+   10. zipalign + apksigner 签名
+   11. 输出到 dist/<channel>/原文件名_patch.apk，更新 state.json
 """
 
 import base64
@@ -47,6 +28,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 import requests
 
@@ -77,7 +59,7 @@ HTTP_HEADERS = {
 
 ABI_KEYWORDS = {
     "ARMv7": ["armv7", "armeabi-v7a", "v7a", "-v7.", "_v7."],
-    "ARMv8": ["armv8", "arm64-v8a", "arm64", "v8a", "-v8.", "_v8."],
+    "ARMv8": ["armv8", "arm64-v8a", "arm64", "aarch64", "v8a", "-v8.", "_v8."],
 }
 
 # MainActivity 的目标路径与注入代码
@@ -88,16 +70,21 @@ INJECT_CODE = [
     '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V',
 ]
 
+# 同时构建的 channel
+CHANNELS = [
+    {"name": "stable", "b": "0", "label": "正式版"},
+    {"name": "beta",   "b": "1", "label": "测试版"},
+]
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
 # --------------------------------------------------------------------------- #
-# 签名证书：自动生成一次 + 上传到 GitHub Secret
+# 签名证书
 # --------------------------------------------------------------------------- #
 def _generate_keystore() -> None:
-    """本地生成一个新的 keystore"""
     log("[!] 未找到 keystore，自动生成一个新的")
     subprocess.run(
         [
@@ -118,27 +105,14 @@ def _generate_keystore() -> None:
 
 
 def _upload_secret_gh(name: str, value: str) -> bool:
-    """
-    用 gh CLI 把 value 写入 GitHub Secret。
-    需要:
-        - 系统有 gh CLI
-        - 环境变量 GH_PAT（有 repo 或 secrets:write 权限）
-        - 环境变量 GITHUB_REPOSITORY（Actions 自动提供，格式 owner/repo）
-    """
     if not shutil.which("gh"):
         log("[!] 未找到 gh CLI，无法自动上传 Secret")
         return False
-
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-    if not repo:
-        log("[!] 未设置 GITHUB_REPOSITORY，无法上传 Secret")
-        return False
-
     pat = os.environ.get("GH_PAT", "").strip()
-    if not pat:
-        log("[!] 未设置 GH_PAT，无法上传 Secret")
+    if not repo or not pat:
+        log("[!] 缺少 GITHUB_REPOSITORY 或 GH_PAT")
         return False
-
     try:
         subprocess.run(
             ["gh", "secret", "set", name, "-R", repo, "-b", value],
@@ -152,18 +126,9 @@ def _upload_secret_gh(name: str, value: str) -> bool:
 
 
 def ensure_keystore() -> None:
-    """
-    优先级:
-        1. release.keystore 文件已存在（本地开发）
-        2. 环境变量 KEYSTORE_B64（Actions 从 Secret 注入）
-        3. 都没有 -> 自动生成 + 上传到 Secret KEYSTORE_B64
-    """
-    # 1. 本地文件
     if KEYSTORE.exists():
         log(f"[*] 使用已有 keystore: {KEYSTORE}")
         return
-
-    # 2. 环境变量
     b64 = os.environ.get("KEYSTORE_B64", "").strip()
     if b64:
         log("[*] 从环境变量 KEYSTORE_B64 解码 keystore")
@@ -172,21 +137,16 @@ def ensure_keystore() -> None:
         except Exception as e:
             raise RuntimeError(f"KEYSTORE_B64 解码失败: {e}")
         return
-
-    # 3. 自动生成
     _generate_keystore()
     b64 = base64.b64encode(KEYSTORE.read_bytes()).decode()
-
     log("[*] 尝试把 keystore 上传到 GitHub Secret KEYSTORE_B64 ...")
     if _upload_secret_gh("KEYSTORE_B64", b64):
         log("[√] 已上传到 Secret KEYSTORE_B64")
-        log("    下次运行会自动从 Secret 读取，不会再生成")
     else:
         log("[!] 上传失败！请手动把下面的 base64 存到 Secret KEYSTORE_B64：")
         log("=" * 60)
         log(b64)
         log("=" * 60)
-        log("    否则下次运行会重新生成，签名会变！")
 
 
 # --------------------------------------------------------------------------- #
@@ -209,19 +169,19 @@ def save_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 1: APK 版本信息（bbk）
+# APK 版本信息（bbk）
 # --------------------------------------------------------------------------- #
-def fetch_version_info() -> dict:
-    log(f"[*] 请求 APK 版本接口: {VERSION_API}")
+def fetch_version_info(b_value: str) -> dict:
+    log(f"[*] 请求 APK 版本接口 (b={b_value}): {VERSION_API}")
     r = requests.post(
         VERSION_API,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data={"b": "1"},
+        data={"b": b_value},
         timeout=60,
     )
     r.raise_for_status()
     data = r.json()
-    log(f"[*] 接口返回: {json.dumps(data, ensure_ascii=False)[:500]}")
+    log(f"[*] 接口返回: {json.dumps(data, ensure_ascii=False)[:400]}")
     return data
 
 
@@ -239,14 +199,12 @@ def parse_version_info(data) -> dict:
         raise ValueError(f"无法解析版本信息: {data!r}")
 
     version = item.get("version") or item.get("version_all") or item.get("ver")
-
     link_obj = item.get("link") or item.get("links") or {}
     onedrive = None
     for k, v in link_obj.items():
         if k.lower().replace(" ", "") == "onedrive" and isinstance(v, dict):
             onedrive = v
             break
-
     if onedrive is None:
         raise ValueError(f"未找到 OneDrive 链接: {link_obj!r}")
 
@@ -254,7 +212,6 @@ def parse_version_info(data) -> dict:
         "ARMv7": onedrive.get("ARMv7") or onedrive.get("armv7"),
         "ARMv8": onedrive.get("ARMv8") or onedrive.get("armv8") or onedrive.get("ARM64"),
     }
-
     if not links["ARMv7"] and not links["ARMv8"]:
         raise ValueError(f"OneDrive 里没有 ARMv7/ARMv8 链接: {onedrive!r}")
 
@@ -268,46 +225,9 @@ def parse_version_info(data) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 2: SO release 信息 + 主版本前缀匹配
+# SO release
 # --------------------------------------------------------------------------- #
-def _version_variants(v: str) -> set:
-    """
-    只生成从开头开始的连续前缀，至少 2 段。
-    1.26.60.28 -> {1.26, 1.26.60, 1.26.60.28}
-    26.60.28   -> {26.60, 26.60.28}
-    """
-    out = set()
-    if not v:
-        return out
-    parts = str(v).split(".")
-    for i in range(2, len(parts) + 1):
-        out.add(".".join(parts[:i]))
-    return out
-
-
-def _release_matches_version(rel: dict, versions: set) -> bool:
-    haystacks = [
-        rel.get("tag_name", "") or "",
-        rel.get("name", "") or "",
-        rel.get("body", "") or "",
-    ]
-    for a in rel.get("assets", []):
-        haystacks.append(a.get("name", "") or "")
-
-    hay = "\n".join(haystacks).lower()
-
-    targets = set()
-    for v in versions:
-        targets |= _version_variants(v)
-
-    hits = sorted([t for t in targets if t in hay], key=len, reverse=True)
-    if hits:
-        log(f"[so] 匹配到适配版本前缀: {', '.join(hits)}")
-        return True
-    return False
-
-
-def fetch_so_release_info(versions: set | None = None) -> dict:
+def fetch_so_release_info() -> dict:
     if not SO_REPO:
         log("[!] 未配置 SO_REPO，跳过 so 检查")
         return {"tag": "", "assets": [], "matched": False}
@@ -331,17 +251,8 @@ def fetch_so_release_info(versions: set | None = None) -> dict:
         {"name": a["name"], "url": a["browser_download_url"], "size": a["size"]}
         for a in rel.get("assets", [])
     ]
-
     log(f"[*] so release tag: {tag}，共 {len(assets)} 个 asset")
-
-    matched = True
-    if versions:
-        matched = _release_matches_version(rel, versions)
-        if not matched:
-            log(f"[!] release {tag} 未包含适配版本前缀 {sorted(versions)}，跳过 so 下载")
-            assets = []
-
-    return {"tag": tag, "assets": assets, "matched": matched}
+    return {"tag": tag, "assets": assets, "matched": True}
 
 
 def _load_so_map() -> dict:
@@ -357,7 +268,6 @@ def _load_so_map() -> dict:
 def download_so_assets(assets: list, dest_root: Path) -> int:
     if not assets:
         return 0
-
     so_map = _load_so_map()
     headers = {"User-Agent": "Mozilla/5.0"}
     if SO_TOKEN:
@@ -369,18 +279,15 @@ def download_so_assets(assets: list, dest_root: Path) -> int:
         if not name.lower().endswith(".so"):
             log(f"[so] 跳过非 .so 文件: {name}")
             continue
-
         low = name.lower()
         abi = next(
             (k for k, kws in ABI_KEYWORDS.items() if any(kw in low for kw in kws)),
             "_common",
         )
-
         mapped = so_map.get(abi, {}).get(name)
         rel = mapped if mapped else name
         dest = dest_root / abi / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-
         log(f"[so] 下载 {name} ({a['size']/1024/1024:.2f} MB) -> {dest.relative_to(dest_root)}")
         with requests.get(a["url"], headers=headers, stream=True, timeout=600) as r:
             r.raise_for_status()
@@ -389,13 +296,12 @@ def download_so_assets(assets: list, dest_root: Path) -> int:
                     if buf:
                         f.write(buf)
         count += 1
-
     log(f"[so] 共下载 {count} 个 .so 文件")
     return count
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 3: 解析 APK 下载直链
+# 解析 APK 下载直链
 # --------------------------------------------------------------------------- #
 def resolve_share_code(share_url: str) -> str:
     return share_url.rstrip("/").rsplit("/s/", 1)[-1]
@@ -415,37 +321,35 @@ def get_openlist_url(share_code: str) -> str:
     )
     r.raise_for_status()
     data = r.json()
-
     if data.get("status") != 200:
         raise RuntimeError(f"get_link 失败: {data}")
-
     msg = data.get("message") or []
     if not msg:
         raise RuntimeError(f"无效链接: {data}")
-
     o_link = msg[0]["o_link"]
     log(f"[*] openlist url: {o_link}")
     return o_link
 
 
 def resolve_download_url(share_url: str) -> str:
-    code = resolve_share_code(share_url)
-    return get_openlist_url(code)
+    return get_openlist_url(resolve_share_code(share_url))
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 4: 流式下载
+# 流式下载
 # --------------------------------------------------------------------------- #
-def download_file(url: str, dest: Path, chunk: int = 1 << 20) -> None:
+def download_file(url: str, dest: Path, chunk: int = 1 << 20) -> str:
     log(f"[*] 下载: {url[:120]}...")
     with requests.get(url, headers=HTTP_HEADERS, stream=True, timeout=600) as r:
         r.raise_for_status()
+        orig_name = dest.name
+        cd = r.headers.get("content-disposition", "")
+        m = re.search(r"filename\*?=(?:UTF-8''|\"?)([^\";]+)", cd, re.I)
+        if m:
+            orig_name = unquote(m.group(1).strip().strip('"'))
+            log(f"[*] 服务端文件名: {orig_name}")
         total = int(r.headers.get("content-length", 0))
-        if total:
-            log(f"[*] 文件大小: {total / 1024 / 1024:.2f} MB")
-        else:
-            log("[*] 文件大小未知")
-
+        log(f"[*] 文件大小: {total/1024/1024:.2f} MB" if total else "[*] 文件大小未知")
         done = 0
         with open(dest, "wb") as f:
             for buf in r.iter_content(chunk_size=chunk):
@@ -455,21 +359,22 @@ def download_file(url: str, dest: Path, chunk: int = 1 << 20) -> None:
                 done += len(buf)
                 if total and done % (100 << 20) < chunk:
                     pct = done * 100 // total
-                    log(f"    进度: {pct}% ({done / 1024 / 1024:.1f}/{total / 1024 / 1024:.1f} MB)")
-
-    log(f"[*] 下载完成，共 {dest.stat().st_size / 1024 / 1024:.2f} MB")
+                    log(f"    进度: {pct}% ({done/1024/1024:.1f}/{total/1024/1024:.1f} MB)")
+    log(f"[*] 下载完成，共 {dest.stat().st_size/1024/1024:.2f} MB")
+    return orig_name
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 5: apktool 解包 / 打包
+# apktool
 # --------------------------------------------------------------------------- #
 def _check_apktool() -> None:
     if not shutil.which("apktool"):
-        raise RuntimeError(
-            "找不到 apktool，请先安装：\n"
-            "  GitHub Actions: sudo apt-get install -y apktool\n"
-            "  本地: 从 https://github.com/iBotPeaches/Apktool/releases 下载"
-        )
+        raise RuntimeError("找不到 apktool")
+    try:
+        out = subprocess.check_output(["apktool", "--version"], text=True).strip()
+        log(f"[*] apktool 版本: {out}")
+    except Exception:
+        pass
 
 
 def extract_with_apktool(apk: Path, out_dir: Path) -> None:
@@ -487,17 +392,22 @@ def repack_with_apktool(src_dir: Path, out_apk: Path) -> None:
     log(f"[*] apktool 打包 -> {out_apk}")
     if out_apk.exists():
         out_apk.unlink()
-    subprocess.run(
-        ["apktool", "b", "--use-aapt2", str(src_dir), "-o", str(out_apk)],
-        check=True,
-    )
+    aapt2 = os.environ.get("AAPT2", "").strip()
+    cmd = ["apktool", "b", "--use-aapt2"]
+    if aapt2 and Path(aapt2).exists():
+        log(f"[*] 使用系统 aapt2: {aapt2}")
+        cmd += ["--aapt", aapt2]
+    else:
+        log("[!] 未找到 AAPT2 环境变量，使用 apktool 自带 aapt2")
+    cmd += [str(src_dir), "-o", str(out_apk)]
+    log(f"[*] 执行: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 6: 修改 MainActivity.smali
+# 修改 MainActivity.smali
 # --------------------------------------------------------------------------- #
 def find_main_activity(unpack_dir: Path) -> Path | None:
-    """在 smali / smali_classes2 / ... 里查找 MainActivity.smali"""
     for smali_dir in sorted(unpack_dir.glob("smali*")):
         candidate = smali_dir / MAIN_ACTIVITY_REL
         if candidate.is_file():
@@ -506,15 +416,6 @@ def find_main_activity(unpack_dir: Path) -> Path | None:
 
 
 def patch_main_activity(smali_path: Path) -> bool:
-    """
-    在 MainActivity 的 public onCreate 方法里：
-      - 把 .locals N 改为 .registers N+4（onCreate 有 2 个参数，多留 2 个本地寄存器）
-      - 若原本就是 .registers N 且 N < 6，改为 .registers 6
-      - 保证 v0 可用
-      - 在 .locals / .registers 行后插入两行指令:
-            const-string v0, "mtbinloader2"
-            invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-    """
     log(f"[*] 修改 smali: {smali_path}")
     text = smali_path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -527,20 +428,16 @@ def patch_main_activity(smali_path: Path) -> bool:
         stripped = line.strip()
         indent = line[: len(line) - len(line.lstrip())]
 
-        # 进入 onCreate
         if not in_oncreate and stripped.startswith(".method"):
             if "onCreate(" in stripped and "public" in stripped:
                 in_oncreate = True
                 out.append(line)
                 continue
 
-        # 在 onCreate 内处理 .locals / .registers
         if in_oncreate and not handled:
             m = re.match(r"\.locals\s+(\d+)", stripped)
             if m:
                 n = int(m.group(1))
-                # .locals N + 2 个参数(this, Bundle) = .registers N+2
-                # 再额外加 2 个本地寄存器空间 -> .registers N+4
                 new_regs = n + 4
                 log(f"[*] .locals {n} -> .registers {new_regs}")
                 out.append(f"{indent}.registers {new_regs}")
@@ -551,7 +448,6 @@ def patch_main_activity(smali_path: Path) -> bool:
             m2 = re.match(r"\.registers\s+(\d+)", stripped)
             if m2:
                 n = int(m2.group(1))
-                # onCreate 有 2 个参数，.registers 至少 6 才能让 v0 是本地寄存器
                 if n < 6:
                     log(f"[*] .registers {n} -> .registers 6")
                     out.append(f"{indent}.registers 6")
@@ -571,24 +467,16 @@ def patch_main_activity(smali_path: Path) -> bool:
         log('[√] 已注入 System.loadLibrary("mtbinloader2")')
     else:
         log("[!] 未在 MainActivity 的 onCreate 中找到 .locals / .registers")
-
     return handled
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 7: 注入 .so
+# 注入 .so
 # --------------------------------------------------------------------------- #
 def inject_so_files(so_dir: Path, unpack_dir: Path) -> int:
-    """
-    将 so_dir 下的 .so 文件按相对路径复制到 apktool 解包目录。
-    so_dir 里已经按 ABI 分好子目录，例如:
-        so_dir/ARMv8/lib/arm64-v8a/libfoo.so
-        so_dir/ARMv7/lib/armeabi-v7a/libfoo.so
-    """
     if not so_dir.exists() or not so_dir.is_dir():
         log(f"[!] 未找到 so 注入目录: {so_dir}，跳过 so 注入")
         return 0
-
     log(f"[*] 从 {so_dir} 注入 .so 文件")
     count = 0
     for src in sorted(so_dir.rglob("*.so")):
@@ -598,13 +486,12 @@ def inject_so_files(so_dir: Path, unpack_dir: Path) -> int:
         shutil.copy2(src, dst)
         count += 1
         log(f"[so] 注入 {rel}")
-
     log(f"[so] 共注入 {count} 个文件")
     return count
 
 
 # --------------------------------------------------------------------------- #
-# 步骤 8: zipalign + 签名
+# zipalign + 签名
 # --------------------------------------------------------------------------- #
 def find_tool(name: str):
     p = shutil.which(name)
@@ -636,7 +523,6 @@ def zipalign_apk(src: Path, dst: Path) -> None:
 def sign_apk(src: Path, dst: Path) -> None:
     if not KEYSTORE.exists():
         raise FileNotFoundError(f"找不到签名证书: {KEYSTORE}")
-
     apksigner = find_tool("apksigner")
     if apksigner:
         log("[*] 使用 apksigner 签名 (v1 + v2)")
@@ -655,7 +541,6 @@ def sign_apk(src: Path, dst: Path) -> None:
             check=True,
         )
         return
-
     log("[!] 未找到 apksigner，回退到 jarsigner")
     shutil.copy(src, dst)
     subprocess.run(
@@ -673,11 +558,12 @@ def sign_apk(src: Path, dst: Path) -> None:
 # --------------------------------------------------------------------------- #
 # 单架构构建
 # --------------------------------------------------------------------------- #
-def build_one(abi: str, share_url: str, version: str) -> Path:
+def build_one(abi: str, share_url: str, version: str,
+              channel: str, out_dir: Path) -> Path:
     log("=" * 60)
-    log(f"[*] 开始构建 {abi}")
+    log(f"[*] 构建 channel={channel} abi={abi}")
 
-    abi_work = WORK_DIR / abi
+    abi_work = WORK_DIR / channel / abi
     if abi_work.exists():
         shutil.rmtree(abi_work)
     abi_work.mkdir(parents=True, exist_ok=True)
@@ -687,7 +573,14 @@ def build_one(abi: str, share_url: str, version: str) -> Path:
 
     # 2. 下载 APK
     original_apk = abi_work / "original.apk"
-    download_file(real_url, original_apk)
+    orig_name = download_file(real_url, original_apk)
+
+    stem = Path(orig_name).stem
+    if stem.lower().endswith("_patch"):
+        out_name = f"{stem}.apk"
+    else:
+        out_name = f"{stem}_patch.apk"
+    log(f"[*] 输出文件名: {out_name}")
 
     # 3. apktool 解包
     unpack_dir = abi_work / "unpack"
@@ -700,14 +593,14 @@ def build_one(abi: str, share_url: str, version: str) -> Path:
     else:
         log(f"[!] 未找到 {MAIN_ACTIVITY_REL}，跳过 smali 修改")
 
-    # 5. 注入 .so（按 ABI 优先，根目录兜底）
+    # 5. 注入 .so
     abi_so_dir = SO_PATCH_DIR / abi
     if abi_so_dir.exists():
         inject_so_files(abi_so_dir, unpack_dir)
     else:
         inject_so_files(SO_PATCH_DIR, unpack_dir)
 
-    # 6. apktool 重新打包
+    # 6. apktool 打包
     rebuilt_apk = abi_work / "rebuilt.apk"
     repack_with_apktool(unpack_dir, rebuilt_apk)
 
@@ -715,15 +608,14 @@ def build_one(abi: str, share_url: str, version: str) -> Path:
     aligned_apk = abi_work / "aligned.apk"
     zipalign_apk(rebuilt_apk, aligned_apk)
 
-    safe_version = str(version or "latest").replace("/", "_").replace("\\", "_")
-    out_apk = DIST_DIR / f"app-{safe_version}-{abi}-signed.apk"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_apk = out_dir / out_name
     sign_apk(aligned_apk, out_apk)
 
     size_mb = out_apk.stat().st_size / 1024 / 1024
     sha256 = hashlib.sha256(out_apk.read_bytes()).hexdigest()
-    log(f"[√] {abi} 构建完成: {out_apk}  ({size_mb:.2f} MB)")
+    log(f"[√] {channel}/{abi} 构建完成: {out_apk}  ({size_mb:.2f} MB)")
     log(f"    SHA256: {sha256}")
-
     return out_apk
 
 
@@ -733,7 +625,6 @@ def build_one(abi: str, share_url: str, version: str) -> Path:
 def main() -> int:
     DIST_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 0. 确保 keystore 存在（首次会自动生成 + 上传 Secret）
     try:
         ensure_keystore()
     except (FileNotFoundError, RuntimeError) as e:
@@ -746,26 +637,13 @@ def main() -> int:
         log(f"[x] {e}")
         return 1
 
-    # 1. 本地状态
+    # 状态
     state = load_state()
-    local_apk = state.get("apk_version", "")
     local_so = state.get("so_tag", "")
-    log(f"[*] 本地状态: apk={local_apk or '(空)'}  so={local_so or '(空)'}")
+    local_apks = state.get("apk_versions", {})
+    log(f"[*] 本地状态: so={local_so or '(空)'}  apk={local_apks}")
 
-    # 2. 取 APK 远程版本
-    try:
-        info = fetch_version_info()
-        parsed = parse_version_info(info)
-    except Exception as e:
-        log(f"[x] 获取 APK 版本失败: {e}")
-        return 1
-
-    remote_ver = str(parsed["version"])
-    remote_ver_all = str(parsed.get("version_all") or parsed["version"])
-    remote_apk = remote_ver_all
-    links = parsed["links"]
-
-    # 3. 取 SO release
+    # SO 最新 release
     try:
         so_info = fetch_so_release_info()
         remote_so = so_info["tag"]
@@ -774,74 +652,130 @@ def main() -> int:
         so_info = {"tag": "", "assets": [], "matched": False}
         remote_so = ""
 
-    # 4. 比对
-    apk_changed = remote_apk != local_apk
-    so_changed = bool(remote_so) and remote_so != local_so and bool(so_info["assets"])
+    so_changed = (
+        bool(remote_so)
+        and remote_so != local_so
+        and bool(so_info["assets"])
+    )
 
-    log(f"[*] APK: 远程={remote_apk}  本地={local_apk or '(空)'}  "
-        f"{'变化' if apk_changed else '未变'}")
-    log(f"[*] SO : 远程={remote_so or '(无)'}  本地={local_so or '(空)'}  "
-        f"assets={len(so_info['assets'])}  "
+    # 逐个 channel 获取版本并比对
+    jobs = []
+    for ch in CHANNELS:
+        try:
+            info = fetch_version_info(ch["b"])
+            parsed = parse_version_info(info)
+        except Exception as e:
+            log(f"[!] {ch['label']} 获取版本失败: {e}")
+            continue
+
+        remote_apk = str(parsed.get("version_all") or parsed["version"])
+        local_apk = local_apks.get(ch["name"], "")
+        apk_changed = remote_apk != local_apk
+
+        log(f"[*] {ch['label']}({ch['name']}): 远程={remote_apk} "
+            f"本地={local_apk or '(空)'} "
+            f"{'变化' if apk_changed else '未变'}")
+
+        if apk_changed or so_changed:
+            jobs.append({
+                "channel": ch,
+                "remote_apk": remote_apk,
+                "links": parsed["links"],
+            })
+
+    log(f"[*] SO: 远程={remote_so or '(无)'} 本地={local_so or '(空)'} "
         f"{'变化' if so_changed else '未变'}")
 
-    if not apk_changed and not so_changed:
-        log("[=] APK 与 SO 均无更新，退出")
+    if not jobs:
+        log("[=] 所有 channel 均无更新，退出")
         return 0
 
-    # 5. 处理 so_patch
+    # 处理 so_patch（共用）
     if so_info["assets"] and (so_changed or not SO_PATCH_DIR.exists()):
         if SO_PATCH_DIR.exists():
             shutil.rmtree(SO_PATCH_DIR)
         SO_PATCH_DIR.mkdir(parents=True, exist_ok=True)
         download_so_assets(so_info["assets"], SO_PATCH_DIR)
+    else:
+        log(f"[*] 复用现有 so_patch（tag={remote_so}）")
 
-    # 6. 工作目录
+    # 工作目录
     if WORK_DIR.exists():
         shutil.rmtree(WORK_DIR)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 7. 逐架构构建
-    outputs = []
+    # 逐 channel 逐 ABI 构建
+    results: dict[str, list[Path]] = {}
     all_ok = True
-    for abi, url in (("ARMv7", links.get("ARMv7")), ("ARMv8", links.get("ARMv8"))):
-        if not url:
-            log(f"[!] 跳过 {abi}: 无下载链接")
-            all_ok = False
-            continue
-        try:
-            outputs.append(build_one(abi, url, remote_apk))
-        except Exception as e:
-            log(f"[x] {abi} 构建失败: {e}")
-            import traceback
-            traceback.print_exc()
-            all_ok = False
 
-    if not outputs:
+    for job in jobs:
+        ch = job["channel"]
+        results[ch["name"]] = []
+        for abi, url in (
+            ("ARMv7", job["links"].get("ARMv7")),
+            ("ARMv8", job["links"].get("ARMv8")),
+        ):
+            if not url:
+                log(f"[!] 跳过 {ch['name']}/{abi}: 无下载链接")
+                all_ok = False
+                continue
+            try:
+                out = build_one(
+                    abi=abi,
+                    share_url=url,
+                    version=job["remote_apk"],
+                    channel=ch["name"],
+                    out_dir=DIST_DIR / ch["name"],
+                )
+                results[ch["name"]].append(out)
+            except Exception as e:
+                log(f"[x] {ch['name']}/{abi} 构建失败: {e}")
+                import traceback
+                traceback.print_exc()
+                all_ok = False
+
+    if not any(results.values()):
         log("[x] 没有任何产物生成")
         return 1
 
-    # 8. 记录状态
+    # 记录状态（全部成功才写）
     if all_ok:
-        save_state({"apk_version": remote_apk, "so_tag": remote_so})
-        log(f"[*] 已记录状态: apk={remote_apk}  so={remote_so}")
+        new_apks = dict(local_apks)
+        for job in jobs:
+            new_apks[job["channel"]["name"]] = job["remote_apk"]
+        save_state({"so_tag": remote_so, "apk_versions": new_apks})
+        log(f"[*] 已记录状态: so={remote_so} apk={new_apks}")
     else:
         log("[!] 存在失败项，不记录状态，下次将重试")
 
+    # 汇总
     log("=" * 60)
-    log(f"[√] 全部完成，共 {len(outputs)} 个产物:")
-    for p in outputs:
-        log(f"    - {p}  ({p.stat().st_size / 1024 / 1024:.2f} MB)")
+    total = 0
+    for ch_name, outs in results.items():
+        if not outs:
+            continue
+        log(f"[√] channel={ch_name} 共 {len(outs)} 个产物:")
+        for p in outs:
+            log(f"    - {p}  ({p.stat().st_size/1024/1024:.2f} MB)")
+            total += 1
+    log(f"[√] 全部完成，共 {total} 个产物")
     log("=" * 60)
 
+    # 输出给 Actions
     gho = os.environ.get("GITHUB_OUTPUT")
     if gho:
         with open(gho, "a", encoding="utf-8") as f:
-            f.write(f"version={remote_apk}\n")
-            f.write("apk_paths<<EOF\n")
-            for p in outputs:
-                f.write(f"{p}\n")
-            f.write("EOF\n")
-
+            for job in jobs:
+                ch = job["channel"]
+                outs = results.get(ch["name"], [])
+                if not outs:
+                    continue
+                tag = f"v{job['remote_apk']}-{ch['name']}"
+                f.write(f"release_tag_{ch['name']}={tag}\n")
+                f.write(f"apk_paths_{ch['name']}<<EOF\n")
+                for p in outs:
+                    f.write(f"{p}\n")
+                f.write("EOF\n")
     return 0
 
 

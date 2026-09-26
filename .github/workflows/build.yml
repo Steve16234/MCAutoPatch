@@ -8,22 +8,19 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install Python deps
         run: pip install requests
 
-      - name: Install apktool
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y apktool
-
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -32,27 +29,37 @@ jobs:
 
       - name: Install build-tools
         run: |
-          yes | sdkmanager --install "build-tools;34.0.0" || true
+          sdkmanager --install "build-tools;34.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+          echo "AAPT2=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> $GITHUB_ENV
+
+      - name: Install apktool 2.11.1
+        run: |
+          wget -q -O /usr/local/bin/apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' \
+            | sudo tee /usr/local/bin/apktool > /dev/null
+          sudo chmod +x /usr/local/bin/apktool
+          apktool --version
 
       - name: Restore state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
-          path: state.json
+          path: |
+            state.json
+            so_patch/
           key: apk-state-${{ github.run_id }}
           restore-keys: apk-state-
 
       - name: Build
         id: build
         env:
-          # keystore: 首次为空，脚本自动生成后回写 Secret
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
-          # 用于首次自动上传 Secret
           GH_PAT: ${{ secrets.GH_PAT }}
-          # so 源
           SO_REPO: ${{ vars.SO_REPO }}
           SO_RELEASE: latest
           SO_TOKEN: ${{ secrets.SO_TOKEN }}
@@ -60,15 +67,43 @@ jobs:
 
       - name: Save state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
-          path: state.json
+          path: |
+            state.json
+            so_patch/
           key: apk-state-${{ github.run_id }}
 
-      - name: Upload APK
-        if: steps.build.outputs.apk_paths
-        uses: actions/upload-artifact@v4
+      # 发布正式版
+      - name: Publish stable
+        if: steps.build.outputs.apk_paths_stable
+        uses: softprops/action-gh-release@v2
         with:
-          name: signed-apks-${{ steps.build.outputs.version }}
-          path: dist/*.apk
-          retention-days: 30
+          tag_name: ${{ steps.build.outputs.release_tag_stable }}
+          name: MC Patch (正式版) ${{ steps.build.outputs.release_tag_stable }}
+          body: |
+            自动构建的 MC 正式版补丁 APK
+
+            - Channel: `stable` (b=0)
+            - 触发时间: ${{ github.run_started_at }}
+          files: dist/stable/*.apk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      # 发布测试版
+      - name: Publish beta
+        if: steps.build.outputs.apk_paths_beta
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.build.outputs.release_tag_beta }}
+          name: MC Patch (测试版) ${{ steps.build.outputs.release_tag_beta }}
+          body: |
+            自动构建的 MC 测试版补丁 APK
+
+            - Channel: `beta` (b=1)
+            - 触发时间: ${{ github.run_started_at }}
+          files: dist/beta/*.apk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
