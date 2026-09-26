@@ -15,8 +15,10 @@ MC 自动补丁构建脚本（GitHub Actions）
     7. 解析分享链接 -> 下载 APK（保留原始文件名）
     8. apktool 解包 -> 修改 MainActivity.smali -> 注入 so
     9. apktool b --aapt <private-aapt2> 重打包
-   10. zipalign + apksigner 签名
-   11. 输出到 dist/<channel>/原文件名_patch.apk，更新 state.json
+   10. zipalign
+   11. apksigner 强制重新生成 V1/V2/V3（V4 关闭）
+   12. apksigner verify 严格确认 V1/V2/V3 全部为 true
+   13. 输出到 dist/<channel>/原文件名_patch.apk，更新 state.json
 """
 
 import base64
@@ -825,55 +827,119 @@ def zipalign_apk(src: Path, dst: Path) -> None:
         raise RuntimeError(f"zipalign 没有生成文件: {dst}")
 
 
+def _verify_required_signatures(apksigner: str, apk: Path) -> dict[str, bool]:
+    """严格验证最终 APK 必须同时具备 V1/V2/V3。"""
+    verify = subprocess.run(
+        [apksigner, "verify", "--verbose", str(apk)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+
+    output = verify.stdout or ""
+    log("[*] apksigner verify:")
+    for line in output.splitlines():
+        if (
+            "Verifies" in line
+            or "Verified using v1 scheme" in line
+            or "Verified using v2 scheme" in line
+            or "Verified using v3 scheme" in line
+            or "Verified using v3.1 scheme" in line
+            or "Verified using v3.2 scheme" in line
+            or "Verified using v4 scheme" in line
+            or "Number of signers:" in line
+        ):
+            log(f"    {line}")
+
+    checks: dict[str, bool] = {}
+    patterns = {
+        "v1": r"Verified using v1 scheme .*?:\s*(true|false)",
+        "v2": r"Verified using v2 scheme .*?:\s*(true|false)",
+        "v3": r"Verified using v3 scheme .*?:\s*(true|false)",
+    }
+
+    for scheme, pattern in patterns.items():
+        match = re.search(pattern, output, re.IGNORECASE)
+        if not match:
+            raise RuntimeError(f"apksigner verify 未找到 {scheme} 验证结果: {apk}")
+        checks[scheme] = match.group(1).lower() == "true"
+
+    if verify.returncode != 0:
+        raise RuntimeError(f"apksigner verify 返回失败: {apk}")
+
+    failed = [name.upper() for name, ok in checks.items() if not ok]
+    if failed:
+        raise RuntimeError(
+            f"APK 签名验证失败，必须全部为 true，但以下方案失败: {', '.join(failed)}: {apk}"
+        )
+
+    return checks
+
+
 def sign_apk(src: Path, dst: Path) -> None:
     if not KEYSTORE.exists():
         raise FileNotFoundError(f"找不到签名证书: {KEYSTORE}")
 
     apksigner = find_tool("apksigner")
     if not apksigner:
-        raise RuntimeError("找不到 apksigner，拒绝回退 jarsigner（无法保证 APK v2 签名）")
+        raise RuntimeError(
+            "找不到 apksigner，禁止回退到 jarsigner；本构建必须重新生成 V1/V2/V3 签名"
+        )
+
+    if not src.is_file() or src.stat().st_size == 0:
+        raise RuntimeError(f"待签名 APK 无效: {src}")
 
     if dst.exists():
         dst.unlink()
 
-    log(f"[*] 使用 apksigner 签名 (v1 + v2): {apksigner}")
-    subprocess.run(
-        [
-            apksigner, "sign",
-            "--ks", str(KEYSTORE),
-            "--ks-pass", f"pass:{KS_PASS}",
-            "--key-pass", f"pass:{KEY_PASS}",
-            "--ks-key-alias", KEY_ALIAS,
-            "--v1-signing-enabled", "true",
-            "--v2-signing-enabled", "true",
-            "--out", str(dst),
-            str(src),
-        ],
-        check=True,
+    # 先输出到临时 APK。只有 V1/V2/V3 全部验证通过后，才替换最终产物。
+    tmp_dst = dst.with_name(dst.name + ".signed.tmp.apk")
+    if tmp_dst.exists():
+        tmp_dst.unlink()
+
+    log(
+        "[*] 使用 apksigner 强制重新签名 "
+        "(V1=true, V2=true, V3=true, V4=false): "
+        f"{apksigner}"
     )
 
-    verify = subprocess.run(
-        [apksigner, "verify", "--verbose", str(dst)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    log("[*] apksigner verify:")
-    for line in verify.stdout.splitlines():
-        log(f"    {line}")
+    cmd = [
+        apksigner, "sign",
+        "--ks", str(KEYSTORE),
+        "--ks-pass", f"pass:{KS_PASS}",
+        "--ks-key-alias", KEY_ALIAS,
+        "--key-pass", f"pass:{KEY_PASS}",
+        "--v1-signing-enabled", "true",
+        "--v2-signing-enabled", "true",
+        "--v3-signing-enabled", "true",
+        "--v4-signing-enabled", "false",
+        "--out", str(tmp_dst),
+        str(src),
+    ]
 
-    if verify.returncode != 0:
-        raise RuntimeError(f"apksigner verify 失败: {dst}")
+    log("[*] 执行 apksigner sign: V1/V2/V3=true, V4=false")
+    try:
+        subprocess.run(cmd, check=True)
 
-    verify_text = verify.stdout
-    v2_match = re.search(
-        r"Verified using v2 scheme .*?:\s*(true|false)",
-        verify_text,
-        re.I,
-    )
-    if v2_match and v2_match.group(1).lower() != "true":
-        raise RuntimeError(f"APK 未通过 v2 签名验证: {dst}")
+        if not tmp_dst.is_file() or tmp_dst.stat().st_size == 0:
+            raise RuntimeError(f"apksigner 未生成有效签名 APK: {tmp_dst}")
+
+        checks = _verify_required_signatures(apksigner, tmp_dst)
+        log(
+            f"[√] 签名验证通过: "
+            f"V1={str(checks['v1']).lower()}, "
+            f"V2={str(checks['v2']).lower()}, "
+            f"V3={str(checks['v3']).lower()}"
+        )
+
+        tmp_dst.replace(dst)
+
+    except Exception:
+        # 失败时不留下一个可能被误发布的坏 APK。
+        tmp_dst.unlink(missing_ok=True)
+        dst.unlink(missing_ok=True)
+        raise
 
     if not dst.is_file() or dst.stat().st_size == 0:
         raise RuntimeError(f"签名后 APK 无效: {dst}")
