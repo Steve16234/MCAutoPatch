@@ -1055,9 +1055,28 @@ def main() -> int:
         return 1
 
     # 工作目录
-    if WORK_DIR.exists():
-        shutil.rmtree(WORK_DIR)
+    # GitHub Actions 会在 workflow 中把可执行的 aapt2 放到
+    # build_work/_tools/aapt2。这里不能再把整个 WORK_DIR 删除，
+    # 否则会把 AAPT2_PATH 指向的文件一起删掉。
+    #
+    # 只清理本次构建的 channel/ABI 工作目录，保留 _tools。
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    tools_dir = (WORK_DIR / "_tools").resolve()
+
+    for child in list(WORK_DIR.iterdir()):
+        try:
+            if child.resolve() == tools_dir:
+                continue
+        except OSError:
+            pass
+
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    log(f"[*] 保留 AAPT2 工具目录: {tools_dir}")
 
     results: dict[str, list[Path]] = {}
     all_ok = not had_version_error
