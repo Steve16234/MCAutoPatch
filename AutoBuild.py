@@ -81,7 +81,7 @@ ABI_KEYWORDS = {
 }
 
 # MainActivity 的目标路径与注入代码
-MAIN_ACTIVITY_REL = Path("com/mojiang/minecraftpe/MainActivity.smali")
+MAIN_ACTIVITY_REL = Path("com/mojang/minecraftpe/MainActivity.smali")
 
 INJECT_CODE = [
     '    const-string v0, "mtbinloader2"',
