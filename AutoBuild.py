@@ -488,7 +488,7 @@ def repack_with_apktool(src_dir: Path, out_apk: Path) -> None:
     if out_apk.exists():
         out_apk.unlink()
     subprocess.run(
-        ["apktool", "b", str(src_dir), "-o", str(out_apk)],
+        ["apktool", "b", "-c" str(src_dir), "-o", str(out_apk)],
         check=True,
     )
 
