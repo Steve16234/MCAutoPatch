@@ -389,17 +389,14 @@ def extract_with_apktool(apk: Path, out_dir: Path) -> None:
 
 
 def repack_with_apktool(src_dir: Path, out_apk: Path) -> None:
+    """
+    使用 apktool b --use-aapt2。
+    aapt2 由 workflow 里的 build-tools 提供，并已加到 PATH 和 /usr/local/bin/aapt2。
+    """
     log(f"[*] apktool 打包 -> {out_apk}")
     if out_apk.exists():
         out_apk.unlink()
-    aapt2 = os.environ.get("AAPT2", "").strip()
-    cmd = ["apktool", "b"]
-    if aapt2 and Path(aapt2).exists():
-        log(f"[*] 使用系统 aapt2: {aapt2}")
-        cmd += ["--aapt", aapt2]
-    else:
-        log("[!] 未找到 AAPT2 环境变量，使用 apktool 自带 aapt2")
-    cmd += [str(src_dir), "-o", str(out_apk)]
+    cmd = ["apktool", "b", "--use-aapt2", str(src_dir), "-o", str(out_apk)]
     log(f"[*] 执行: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
