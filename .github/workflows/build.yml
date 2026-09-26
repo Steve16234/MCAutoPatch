@@ -8,30 +8,33 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v6
+      - name: Setup Python
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Install Python deps
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - uses: actions/setup-java@v5
+      - name: Setup Java
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v4
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
 
-      - name: Install build-tools
+      - name: Install pinned Android Build Tools
         shell: bash
         run: |
           set -euo pipefail
@@ -40,57 +43,43 @@ jobs:
 
           BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
           AAPT2_SOURCE="$BUILD_TOOLS/aapt2"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          LOCAL_TOOLS="$GITHUB_WORKSPACE/build_work/_tools"
 
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "BUILD_TOOLS=$BUILD_TOOLS"
-          echo "AAPT2_SOURCE=$AAPT2_SOURCE"
+          test -f "$AAPT2_SOURCE"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
 
-          if [ ! -f "$AAPT2_SOURCE" ]; then
-            echo "[x] 找不到 aapt2: $AAPT2_SOURCE"
-            exit 1
-          fi
+          mkdir -p "$LOCAL_TOOLS"
 
-          # 不修改 Android SDK 原始 aapt2
-          # 复制到 GitHub Workspace 后再设置执行权限
-          mkdir -p "$GITHUB_WORKSPACE/build_work/_tools"
+          # 不修改 Android SDK 原始 aapt2 的权限，只复制到 workspace。
+          cp "$AAPT2_SOURCE" "$LOCAL_TOOLS/aapt2"
+          chmod 755 "$LOCAL_TOOLS/aapt2"
 
-          AAPT2_LOCAL="$GITHUB_WORKSPACE/build_work/_tools/aapt2"
+          echo '=== pinned Android tools ==='
+          "$LOCAL_TOOLS/aapt2" version
+          "$APKSIGNER" version
+          "$ZIPALIGN" -h | head -3 || true
 
-          cp "$AAPT2_SOURCE" "$AAPT2_LOCAL"
-          chmod 755 "$AAPT2_LOCAL"
+          echo "BUILD_TOOLS_VERSION=34.0.0" >> "$GITHUB_ENV"
+          echo "AAPT2_PATH=$LOCAL_TOOLS/aapt2" >> "$GITHUB_ENV"
+          echo "APKSIGNER_PATH=$APKSIGNER" >> "$GITHUB_ENV"
+          echo "ZIPALIGN_PATH=$ZIPALIGN" >> "$GITHUB_ENV"
 
-          if [ ! -x "$AAPT2_LOCAL" ]; then
-            echo "[x] 本地 aapt2 无法执行"
-            ls -la "$GITHUB_WORKSPACE/build_work/_tools"
-            exit 1
-          fi
+          # 固定 34.0.0 工具目录优先于 runner 预装的其它版本。
+          echo "$BUILD_TOOLS" >> "$GITHUB_PATH"
 
-          echo "=== Local AAPT2 ==="
-          ls -la "$AAPT2_LOCAL"
-
-          "$AAPT2_LOCAL" version
-
-          # 提供给 AutoBuild.py
-          echo "AAPT2_PATH=$AAPT2_LOCAL" >> "$GITHUB_ENV"
-
-          # 加入 PATH
-          echo "$GITHUB_WORKSPACE/build_work/_tools" >> "$GITHUB_PATH"
-
-      - name: Install apktool 2.11.1
+      - name: Install Apktool 2.11.1
         shell: bash
         run: |
           set -euo pipefail
-
           wget -q -O /usr/local/bin/apktool.jar \
-            "https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar"
-
-          printf '%s\n' \
-            '#!/bin/bash' \
+            'https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar'
+          printf '%s\n' '#!/bin/bash' \
             'exec java -jar /usr/local/bin/apktool.jar "$@"' \
             | sudo tee /usr/local/bin/apktool > /dev/null
-
           sudo chmod 755 /usr/local/bin/apktool
-
           apktool --version
 
       - name: Restore state
@@ -115,21 +104,38 @@ jobs:
           SO_RELEASE: latest
           SO_TOKEN: ${{ secrets.SO_TOKEN }}
           AAPT2_PATH: ${{ env.AAPT2_PATH }}
+          APKSIGNER_PATH: ${{ env.APKSIGNER_PATH }}
+          ZIPALIGN_PATH: ${{ env.ZIPALIGN_PATH }}
+          BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOLS_VERSION }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== Build environment ==="
+          echo '=== Build environment ==='
+          echo "BUILD_TOOLS_VERSION=$BUILD_TOOLS_VERSION"
           echo "AAPT2_PATH=$AAPT2_PATH"
+          echo "APKSIGNER_PATH=$APKSIGNER_PATH"
+          echo "ZIPALIGN_PATH=$ZIPALIGN_PATH"
 
-          if [ ! -x "$AAPT2_PATH" ]; then
-            echo "[x] AAPT2 不存在或不可执行"
-            exit 1
-          fi
+          test -x "$AAPT2_PATH"
+          test -x "$APKSIGNER_PATH"
+          test -x "$ZIPALIGN_PATH"
 
           "$AAPT2_PATH" version
+          "$APKSIGNER_PATH" version
 
           python AutoBuild.py
+
+      - name: Upload failed signing diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            dist/**/*.signed.tmp.apk
+            build_work/**/aligned.apk
+          retention-days: 1
 
       - name: Save state
         if: always()
@@ -148,7 +154,6 @@ jobs:
           name: MC Patch (正式版) ${{ steps.build.outputs.release_tag_stable }}
           body: |
             自动构建的 MC 正式版补丁 APK
-
             - Channel: `stable` (b=0)
             - 触发时间: ${{ github.run_started_at }}
           files: dist/stable/*.apk
@@ -164,7 +169,6 @@ jobs:
           name: MC Patch (测试版) ${{ steps.build.outputs.release_tag_beta }}
           body: |
             自动构建的 MC 测试版补丁 APK
-
             - Channel: `beta` (b=1)
             - 触发时间: ${{ github.run_started_at }}
           files: dist/beta/*.apk
