@@ -1,0 +1,74 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install requests
+
+      - name: Install apktool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apktool
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install build-tools
+        run: |
+          yes | sdkmanager --install "build-tools;34.0.0" || true
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: apk-state-${{ github.run_id }}
+          restore-keys: apk-state-
+
+      - name: Build
+        id: build
+        env:
+          # keystore: 首次为空，脚本自动生成后回写 Secret
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
+          # 用于首次自动上传 Secret
+          GH_PAT: ${{ secrets.GH_PAT }}
+          # so 源
+          SO_REPO: ${{ vars.SO_REPO }}
+          SO_RELEASE: latest
+          SO_TOKEN: ${{ secrets.SO_TOKEN }}
+        run: python AutoBuild.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: apk-state-${{ github.run_id }}
+
+      - name: Upload APK
+        if: steps.build.outputs.apk_paths
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apks-${{ steps.build.outputs.version }}
+          path: dist/*.apk
+          retention-days: 30

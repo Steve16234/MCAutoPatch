@@ -1,0 +1,8 @@
+release.keystore
+keystore.b64
+state.json
+so_patch/
+build_work/
+dist/
+__pycache__/
+*.pyc
