@@ -15,10 +15,8 @@ MC 自动补丁构建脚本（GitHub Actions）
     7. 解析分享链接 -> 下载 APK（保留原始文件名）
     8. apktool 解包 -> 修改 MainActivity.smali -> 注入 so
     9. apktool b --aapt <private-aapt2> 重打包
-   10. zipalign
-   11. apksigner 强制重新生成 V1/V2/V3（V4 关闭）
-   12. apksigner verify 严格确认 V1/V2/V3 全部为 true
-   13. 输出到 dist/<channel>/原文件名_patch.apk，更新 state.json
+   10. zipalign + apksigner 签名
+   11. 输出到 dist/<channel>/原文件名_patch.apk，更新 state.json
 """
 
 import base64
@@ -790,27 +788,43 @@ def inject_so_files(so_dir: Path, unpack_dir: Path, abi: str) -> int:
 # --------------------------------------------------------------------------- #
 # zipalign + 签名
 # --------------------------------------------------------------------------- #
-def find_tool(name: str):
-    p = shutil.which(name)
-    if p:
-        return p
+BUILD_TOOLS_VERSION = os.environ.get("BUILD_TOOLS_VERSION", "34.0.0").strip() or "34.0.0"
 
-    candidates: list[Path] = []
+def find_tool(name: str):
+    """Find Android build tools deterministically.
+
+    Prefer an explicit *_PATH, then the pinned BUILD_TOOLS_VERSION, and only
+    use PATH as a last resort. This prevents a preinstalled newer build-tools
+    (for example 37.0.0) from silently replacing the workflow's 34.0.0 tools.
+    """
+    env_name = {
+        "aapt2": "AAPT2_PATH",
+        "zipalign": "ZIPALIGN_PATH",
+        "apksigner": "APKSIGNER_PATH",
+    }.get(name)
+
+    if env_name:
+        configured = os.environ.get(env_name, "").strip()
+        if configured:
+            p = Path(configured).expanduser()
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            if p.is_file():
+                return str(p.resolve())
+            raise RuntimeError(f"{env_name} 指向的文件不存在: {p}")
+
     for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
         home = os.environ.get(env, "").strip()
         if not home:
             continue
-        build_tools = Path(home) / "build-tools"
-        if not build_tools.is_dir():
-            continue
-        candidates.extend(
-            p for p in build_tools.glob(f"*/{name}")
-            if p.is_file()
-        )
+        p = Path(home) / "build-tools" / BUILD_TOOLS_VERSION / name
+        if p.is_file():
+            return str(p.resolve())
 
-    if candidates:
-        candidates.sort(key=lambda p: p.parent.name, reverse=True)
-        return str(candidates[0])
+    p = shutil.which(name)
+    if p:
+        log(f"[!] 未找到固定 Build Tools {BUILD_TOOLS_VERSION} 的 {name}，回退 PATH: {p}")
+        return p
 
     return None
 
@@ -818,7 +832,7 @@ def find_tool(name: str):
 def zipalign_apk(src: Path, dst: Path) -> None:
     tool = find_tool("zipalign")
     if not tool:
-        raise RuntimeError("找不到 zipalign")
+        raise RuntimeError(f"找不到 zipalign（要求 Build Tools {BUILD_TOOLS_VERSION}）")
     if dst.exists():
         dst.unlink()
     log(f"[*] zipalign: {tool}")
@@ -828,7 +842,7 @@ def zipalign_apk(src: Path, dst: Path) -> None:
 
 
 def _verify_required_signatures(apksigner: str, apk: Path) -> dict[str, bool]:
-    """严格验证最终 APK 必须同时具备 V1/V2/V3。"""
+    """Strictly require V1, V2 and V3 to verify on the final APK."""
     verify = subprocess.run(
         [apksigner, "verify", "--verbose", str(apk)],
         stdout=subprocess.PIPE,
@@ -836,44 +850,40 @@ def _verify_required_signatures(apksigner: str, apk: Path) -> dict[str, bool]:
         text=True,
         check=False,
     )
-
     output = verify.stdout or ""
     log("[*] apksigner verify:")
     for line in output.splitlines():
-        if (
-            "Verifies" in line
-            or "Verified using v1 scheme" in line
-            or "Verified using v2 scheme" in line
-            or "Verified using v3 scheme" in line
-            or "Verified using v3.1 scheme" in line
-            or "Verified using v3.2 scheme" in line
-            or "Verified using v4 scheme" in line
-            or "Number of signers:" in line
-        ):
+        if any(k in line for k in (
+            "Verifies", "Verified using v1 scheme", "Verified using v2 scheme",
+            "Verified using v3 scheme", "Verified using v3.1 scheme",
+            "Verified using v3.2 scheme", "Verified using v4 scheme",
+            "Number of signers:",
+        )):
             log(f"    {line}")
 
-    checks: dict[str, bool] = {}
     patterns = {
         "v1": r"Verified using v1 scheme .*?:\s*(true|false)",
         "v2": r"Verified using v2 scheme .*?:\s*(true|false)",
         "v3": r"Verified using v3 scheme .*?:\s*(true|false)",
     }
-
+    checks: dict[str, bool] = {}
     for scheme, pattern in patterns.items():
-        match = re.search(pattern, output, re.IGNORECASE)
-        if not match:
-            raise RuntimeError(f"apksigner verify 未找到 {scheme} 验证结果: {apk}")
-        checks[scheme] = match.group(1).lower() == "true"
+        m = re.search(pattern, output, re.IGNORECASE)
+        if not m:
+            raise RuntimeError(f"apksigner verify 未找到 {scheme} 验证结果: {apk}\n{output}")
+        checks[scheme] = m.group(1).lower() == "true"
 
     if verify.returncode != 0:
-        raise RuntimeError(f"apksigner verify 返回失败: {apk}")
+        failed = [k.upper() for k, ok in checks.items() if not ok]
+        raise RuntimeError(
+            f"apksigner verify 返回失败: {apk}; 失败方案={', '.join(failed) or 'unknown'}\n{output}"
+        )
 
-    failed = [name.upper() for name, ok in checks.items() if not ok]
+    failed = [k.upper() for k, ok in checks.items() if not ok]
     if failed:
         raise RuntimeError(
             f"APK 签名验证失败，必须全部为 true，但以下方案失败: {', '.join(failed)}: {apk}"
         )
-
     return checks
 
 
@@ -884,26 +894,24 @@ def sign_apk(src: Path, dst: Path) -> None:
     apksigner = find_tool("apksigner")
     if not apksigner:
         raise RuntimeError(
-            "找不到 apksigner，禁止回退到 jarsigner；本构建必须重新生成 V1/V2/V3 签名"
+            f"找不到 apksigner（要求 Build Tools {BUILD_TOOLS_VERSION}），禁止回退 jarsigner"
         )
 
     if not src.is_file() or src.stat().st_size == 0:
         raise RuntimeError(f"待签名 APK 无效: {src}")
 
+    dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
         dst.unlink()
 
-    # 先输出到临时 APK。只有 V1/V2/V3 全部验证通过后，才替换最终产物。
+    # 临时产物只有在 V1/V2/V3 全部验证通过后才替换最终 APK。
     tmp_dst = dst.with_name(dst.name + ".signed.tmp.apk")
-    if tmp_dst.exists():
-        tmp_dst.unlink()
+    tmp_dst.unlink(missing_ok=True)
 
     log(
-        "[*] 使用 apksigner 强制重新签名 "
-        "(V1=true, V2=true, V3=true, V4=false): "
-        f"{apksigner}"
+        f"[*] 使用 apksigner 强制重新签名 "
+        f"（V1=true，V2=true，V3=true，V4=false）: {apksigner}"
     )
-
     cmd = [
         apksigner, "sign",
         "--ks", str(KEYSTORE),
@@ -918,26 +926,21 @@ def sign_apk(src: Path, dst: Path) -> None:
         str(src),
     ]
 
-    log("[*] 执行 apksigner sign: V1/V2/V3=true, V4=false")
     try:
+        log("[*] 执行 apksigner sign：V1/V2/V3=true，V4=false")
         subprocess.run(cmd, check=True)
-
         if not tmp_dst.is_file() or tmp_dst.stat().st_size == 0:
             raise RuntimeError(f"apksigner 未生成有效签名 APK: {tmp_dst}")
 
         checks = _verify_required_signatures(apksigner, tmp_dst)
         log(
-            f"[√] 签名验证通过: "
-            f"V1={str(checks['v1']).lower()}, "
-            f"V2={str(checks['v2']).lower()}, "
-            f"V3={str(checks['v3']).lower()}"
+            f"[√] 签名验证通过：V1={str(checks['v1']).lower()}，"
+            f"V2={str(checks['v2']).lower()}，V3={str(checks['v3']).lower()}"
         )
-
         tmp_dst.replace(dst)
-
     except Exception:
-        # 失败时不留下一个可能被误发布的坏 APK。
-        tmp_dst.unlink(missing_ok=True)
+        # 调试阶段保留临时 APK，便于检查 V1/V2/V3 到底生成了什么。
+        log(f"[!] 签名验证失败，保留诊断文件：{tmp_dst}")
         dst.unlink(missing_ok=True)
         raise
 
@@ -1120,29 +1123,17 @@ def main() -> int:
         log("[x] 没有可用 so_patch")
         return 1
 
-    # 工作目录
-    # GitHub Actions 会在 workflow 中把可执行的 aapt2 放到
-    # build_work/_tools/aapt2。这里不能再把整个 WORK_DIR 删除，
-    # 否则会把 AAPT2_PATH 指向的文件一起删掉。
-    #
-    # 只清理本次构建的 channel/ABI 工作目录，保留 _tools。
+    # 工作目录：保留 workflow 预置的 build_work/_tools/aapt2，避免清理后
+    # AAPT2_PATH 变成悬空路径。其余旧构建内容全部清理。
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    tools_dir = (WORK_DIR / "_tools").resolve()
-
     for child in list(WORK_DIR.iterdir()):
-        try:
-            if child.resolve() == tools_dir:
-                continue
-        except OSError:
-            pass
-
+        if child.name == "_tools":
+            log(f"[*] 保留 AAPT2 工具目录: {child}")
+            continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
         else:
             child.unlink(missing_ok=True)
-
-    tools_dir.mkdir(parents=True, exist_ok=True)
-    log(f"[*] 保留 AAPT2 工具目录: {tools_dir}")
 
     results: dict[str, list[Path]] = {}
     all_ok = not had_version_error
