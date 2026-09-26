@@ -488,7 +488,7 @@ def repack_with_apktool(src_dir: Path, out_apk: Path) -> None:
     if out_apk.exists():
         out_apk.unlink()
     subprocess.run(
-        ["apktool", "b", "-c", str(src_dir), "-o", str(out_apk)],
+        ["apktool", "b", "-r", str(src_dir), "-o", str(out_apk)],
         check=True,
     )
 
@@ -767,7 +767,7 @@ def main() -> int:
 
     # 3. 取 SO release
     try:
-        so_info = fetch_so_release_info({remote_ver, remote_ver_all})
+        so_info = fetch_so_release_info()
         remote_so = so_info["tag"]
     except Exception as e:
         log(f"[!] 获取 so release 失败: {e}")
