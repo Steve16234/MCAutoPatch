@@ -32,7 +32,10 @@ jobs:
           sdkmanager --install "build-tools;34.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
-          echo "AAPT2=$ANDROID_HOME/build-tools/34.0.0/aapt2" >> $GITHUB_ENV
+          chmod +x "$ANDROID_HOME/build-tools/34.0.0/aapt2"
+          sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/aapt2" /usr/local/bin/aapt2
+          ls -la /usr/local/bin/aapt2
+          aapt2 version || true
 
       - name: Install apktool 2.11.1
         run: |
