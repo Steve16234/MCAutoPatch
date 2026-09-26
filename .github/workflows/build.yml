@@ -8,8 +8,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v5
 
@@ -18,32 +20,77 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python deps
-        run: pip install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
 
       - uses: actions/setup-java@v5
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
       - uses: android-actions/setup-android@v4
 
       - name: Install build-tools
+        shell: bash
         run: |
+          set -euo pipefail
+
           sdkmanager --install "build-tools;34.0.0"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
-          chmod +x "$ANDROID_HOME/build-tools/34.0.0/aapt2"
-          sudo ln -sf "$ANDROID_HOME/build-tools/34.0.0/aapt2" /usr/local/bin/aapt2
-          ls -la /usr/local/bin/aapt2
-          aapt2 version || true
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          AAPT2_SOURCE="$BUILD_TOOLS/aapt2"
+
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "BUILD_TOOLS=$BUILD_TOOLS"
+          echo "AAPT2_SOURCE=$AAPT2_SOURCE"
+
+          if [ ! -f "$AAPT2_SOURCE" ]; then
+            echo "[x] 找不到 aapt2: $AAPT2_SOURCE"
+            exit 1
+          fi
+
+          # 不修改 Android SDK 原始 aapt2
+          # 复制到 GitHub Workspace 后再设置执行权限
+          mkdir -p "$GITHUB_WORKSPACE/build_work/_tools"
+
+          AAPT2_LOCAL="$GITHUB_WORKSPACE/build_work/_tools/aapt2"
+
+          cp "$AAPT2_SOURCE" "$AAPT2_LOCAL"
+          chmod 755 "$AAPT2_LOCAL"
+
+          if [ ! -x "$AAPT2_LOCAL" ]; then
+            echo "[x] 本地 aapt2 无法执行"
+            ls -la "$GITHUB_WORKSPACE/build_work/_tools"
+            exit 1
+          fi
+
+          echo "=== Local AAPT2 ==="
+          ls -la "$AAPT2_LOCAL"
+
+          "$AAPT2_LOCAL" version
+
+          # 提供给 AutoBuild.py
+          echo "AAPT2_PATH=$AAPT2_LOCAL" >> "$GITHUB_ENV"
+
+          # 加入 PATH
+          echo "$GITHUB_WORKSPACE/build_work/_tools" >> "$GITHUB_PATH"
 
       - name: Install apktool 2.11.1
+        shell: bash
         run: |
+          set -euo pipefail
+
           wget -q -O /usr/local/bin/apktool.jar \
-            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
-          printf '#!/bin/bash\nexec java -jar /usr/local/bin/apktool.jar "$@"\n' \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar"
+
+          printf '%s\n' \
+            '#!/bin/bash' \
+            'exec java -jar /usr/local/bin/apktool.jar "$@"' \
             | sudo tee /usr/local/bin/apktool > /dev/null
-          sudo chmod +x /usr/local/bin/apktool
+
+          sudo chmod 755 /usr/local/bin/apktool
+
           apktool --version
 
       - name: Restore state
@@ -53,7 +100,8 @@ jobs:
             state.json
             so_patch/
           key: apk-state-${{ github.run_id }}
-          restore-keys: apk-state-
+          restore-keys: |
+            apk-state-
 
       - name: Build
         id: build
@@ -66,7 +114,22 @@ jobs:
           SO_REPO: ${{ vars.SO_REPO }}
           SO_RELEASE: latest
           SO_TOKEN: ${{ secrets.SO_TOKEN }}
-        run: python AutoBuild.py
+          AAPT2_PATH: ${{ env.AAPT2_PATH }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Build environment ==="
+          echo "AAPT2_PATH=$AAPT2_PATH"
+
+          if [ ! -x "$AAPT2_PATH" ]; then
+            echo "[x] AAPT2 不存在或不可执行"
+            exit 1
+          fi
+
+          "$AAPT2_PATH" version
+
+          python AutoBuild.py
 
       - name: Save state
         if: always()
@@ -77,7 +140,6 @@ jobs:
             so_patch/
           key: apk-state-${{ github.run_id }}
 
-      # 发布正式版
       - name: Publish stable
         if: steps.build.outputs.apk_paths_stable
         uses: softprops/action-gh-release@v2
@@ -94,7 +156,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
 
-      # 发布测试版
       - name: Publish beta
         if: steps.build.outputs.apk_paths_beta
         uses: softprops/action-gh-release@v2
