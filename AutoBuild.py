@@ -393,7 +393,7 @@ def repack_with_apktool(src_dir: Path, out_apk: Path) -> None:
     if out_apk.exists():
         out_apk.unlink()
     aapt2 = os.environ.get("AAPT2", "").strip()
-    cmd = ["apktool", "b", "--use-aapt2"]
+    cmd = ["apktool", "b"]
     if aapt2 and Path(aapt2).exists():
         log(f"[*] 使用系统 aapt2: {aapt2}")
         cmd += ["--aapt", aapt2]
