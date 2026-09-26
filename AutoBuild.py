@@ -14,7 +14,7 @@ MC 自动补丁构建脚本（GitHub Actions）
     6. 下载 so 到 so_patch/<ABI>/（tag 变化时重下）
     7. 解析分享链接 -> 下载 APK（保留原始文件名）
     8. apktool 解包 -> 修改 MainActivity.smali -> 注入 so
-    9. apktool b --use-aapt2 重打包
+    9. apktool b --aapt <private-aapt2> 重打包
    10. zipalign + apksigner 签名
    11. 输出到 dist/<channel>/原文件名_patch.apk，更新 state.json
 """
@@ -438,25 +438,49 @@ def _check_apktool() -> None:
 
 
 def _prepare_aapt2() -> str:
-    """Copy a working aapt2 into the build workspace.
+    """Return a verified, executable aapt2 path for Apktool.
 
-    Apktool 2.11.x accepts either --use-aapt2 or --aapt, never both.
-    We deliberately use --aapt with a private executable copy so Apktool
-    does not need to chmod the Android SDK's read-only/system-owned binary.
+    Priority:
+      1. AAPT2_PATH supplied by GitHub Actions/workflow.
+      2. aapt2 found on PATH.
+      3. Android SDK build-tools.
+
+    IMPORTANT:
+      - Never chmod the Android SDK's original aapt2.
+      - --aapt and --use-aapt2 must never be used together.
+      - When the selected binary is not already a writable executable copy,
+        copy it into WORK_DIR/_tools/aapt2 and chmod only that copy.
     """
-    source: str | None = shutil.which("aapt2")
 
-    if source:
-        source_path = Path(source).resolve()
-    else:
-        source_path = None
-        for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
-            sdk = os.environ.get(env, "").strip()
+    configured = os.environ.get("AAPT2_PATH", "").strip()
+    source_path: Path | None = None
+
+    if configured:
+        candidate = Path(configured).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        candidate = candidate.resolve()
+        if not candidate.is_file():
+            raise RuntimeError(f"AAPT2_PATH 指向的文件不存在: {candidate}")
+        source_path = candidate
+        log(f"[*] 使用环境变量 AAPT2_PATH: {source_path}")
+
+    if source_path is None:
+        path_aapt2 = shutil.which("aapt2")
+        if path_aapt2:
+            source_path = Path(path_aapt2).resolve()
+            log(f"[*] PATH 中找到 aapt2: {source_path}")
+
+    if source_path is None:
+        for env_name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            sdk = os.environ.get(env_name, "").strip()
             if not sdk:
                 continue
+
             sdk_path = Path(sdk)
             if not sdk_path.is_dir():
                 continue
+
             candidates = [
                 p for p in sdk_path.glob("build-tools/*/aapt2")
                 if p.is_file()
@@ -464,24 +488,39 @@ def _prepare_aapt2() -> str:
             if candidates:
                 candidates.sort(key=lambda p: p.parent.name, reverse=True)
                 source_path = candidates[0].resolve()
+                log(f"[*] Android SDK 中找到 aapt2: {source_path}")
                 break
 
-    if source_path is None or not source_path.is_file():
-        raise RuntimeError("找不到 aapt2，请安装 Android SDK Build Tools")
+    if source_path is None:
+        raise RuntimeError(
+            "找不到 aapt2，请安装 Android SDK Build Tools 或设置 AAPT2_PATH"
+        )
 
     if not os.access(source_path, os.R_OK):
         raise RuntimeError(f"aapt2 无法读取: {source_path}")
 
-    local_dir = WORK_DIR / "_tools"
-    local_dir.mkdir(parents=True, exist_ok=True)
-    local_aapt2 = local_dir / "aapt2"
+    # 如果 workflow 已经提供一个工作区中的可执行副本，直接使用。
+    try:
+        source_is_workspace_copy = source_path.parent.resolve() == (WORK_DIR / "_tools").resolve()
+    except OSError:
+        source_is_workspace_copy = False
 
-    # shutil.copyfile avoids propagating broken/readonly source permissions.
-    shutil.copyfile(source_path, local_aapt2)
-    os.chmod(local_aapt2, 0o755)
+    if source_is_workspace_copy and os.access(source_path, os.X_OK):
+        local_aapt2 = source_path
+    else:
+        local_dir = WORK_DIR / "_tools"
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_aapt2 = local_dir / "aapt2"
+
+        # 只复制，不碰 Android SDK 原始文件的权限。
+        shutil.copyfile(source_path, local_aapt2)
+        os.chmod(local_aapt2, 0o755)
+
+    if not local_aapt2.is_file():
+        raise RuntimeError(f"aapt2 副本不存在: {local_aapt2}")
 
     if not os.access(local_aapt2, os.X_OK):
-        raise RuntimeError(f"aapt2 副本不可执行: {local_aapt2}")
+        raise RuntimeError(f"aapt2 不可执行: {local_aapt2}")
 
     try:
         result = subprocess.run(
@@ -493,10 +532,15 @@ def _prepare_aapt2() -> str:
             check=True,
         )
     except Exception as e:
-        raise RuntimeError(f"aapt2 无法执行: {local_aapt2}: {e}") from e
+        raise RuntimeError(
+            f"aapt2 无法正常执行: {local_aapt2}: {e}"
+        ) from e
 
-    version = next((line.strip() for line in result.stdout.splitlines() if line.strip()), "unknown")
-    log(f"[*] 使用 aapt2: {local_aapt2}")
+    version = next(
+        (line.strip() for line in result.stdout.splitlines() if line.strip()),
+        "unknown",
+    )
+    log(f"[*] 最终使用 aapt2: {local_aapt2}")
     log(f"[*] aapt2 版本: {version}")
     return str(local_aapt2)
 
