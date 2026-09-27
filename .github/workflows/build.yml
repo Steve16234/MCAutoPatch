@@ -2,14 +2,27 @@ name: Build APK
 
 on:
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 忽略版本状态，强制重新构建并签名
+        type: boolean
+        required: false
+        default: false
   schedule:
     - cron: '0 3 * * *'
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      BUILD_TOOLS_VERSION: '34.0.0'
+      PYTHONUNBUFFERED: '1'
 
     steps:
       - name: Checkout
@@ -23,7 +36,10 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          python -m pip install -r requirements.txt
+
+      - name: Check build script syntax
+        run: python -m py_compile AutoBuild.py
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -39,9 +55,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          sdkmanager --install "build-tools;34.0.0"
+          sdkmanager --install "build-tools;$BUILD_TOOLS_VERSION"
 
-          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
           AAPT2_SOURCE="$BUILD_TOOLS/aapt2"
           APKSIGNER="$BUILD_TOOLS/apksigner"
           ZIPALIGN="$BUILD_TOOLS/zipalign"
@@ -62,7 +78,6 @@ jobs:
           "$APKSIGNER" version
           "$ZIPALIGN" -h | head -3 || true
 
-          echo "BUILD_TOOLS_VERSION=34.0.0" >> "$GITHUB_ENV"
           echo "AAPT2_PATH=$LOCAL_TOOLS/aapt2" >> "$GITHUB_ENV"
           echo "APKSIGNER_PATH=$APKSIGNER" >> "$GITHUB_ENV"
           echo "ZIPALIGN_PATH=$ZIPALIGN" >> "$GITHUB_ENV"
@@ -88,9 +103,13 @@ jobs:
           path: |
             state.json
             so_patch/
-          key: apk-state-${{ github.run_id }}
+          key: apk-state-v2-${{ github.ref }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            apk-state-
+            apk-state-v2-${{ github.ref }}-
+
+      - name: Force rebuild
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild }}
+        run: python -c "from pathlib import Path; Path('state.json').unlink(missing_ok=True)"
 
       - name: Build
         id: build
@@ -98,15 +117,11 @@ jobs:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || secrets.KEYSTORE_PASSWORD || 'android' }}
           GH_PAT: ${{ secrets.GH_PAT }}
           SO_REPO: ${{ vars.SO_REPO }}
           SO_RELEASE: latest
           SO_TOKEN: ${{ secrets.SO_TOKEN }}
-          AAPT2_PATH: ${{ env.AAPT2_PATH }}
-          APKSIGNER_PATH: ${{ env.APKSIGNER_PATH }}
-          ZIPALIGN_PATH: ${{ env.ZIPALIGN_PATH }}
-          BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOLS_VERSION }}
         shell: bash
         run: |
           set -euo pipefail
@@ -124,27 +139,20 @@ jobs:
           "$AAPT2_PATH" version
           "$APKSIGNER_PATH" version
 
-          python AutoBuild.py
+          # pipefail 保留 Python 的失败状态，同时保存完整签名/验签日志。
+          python AutoBuild.py 2>&1 | tee build.log
 
       - name: Upload failed signing diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: signing-diagnostics-${{ github.run_id }}
+          name: signing-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           path: |
+            build.log
             dist/**/*.signed.tmp.apk
             build_work/**/aligned.apk
           retention-days: 1
-
-      - name: Save state
-        if: always()
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            state.json
-            so_patch/
-          key: apk-state-${{ github.run_id }}
 
       - name: Publish stable
         if: steps.build.outputs.apk_paths_stable
@@ -155,11 +163,12 @@ jobs:
           body: |
             自动构建的 MC 正式版补丁 APK
             - Channel: `stable` (b=0)
-            - 触发时间: ${{ github.run_started_at }}
+            - 构建记录: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - 签名验证: V1 / V2 / V3
           files: dist/stable/*.apk
           fail_on_unmatched_files: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
 
       - name: Publish beta
         if: steps.build.outputs.apk_paths_beta
@@ -170,8 +179,19 @@ jobs:
           body: |
             自动构建的 MC 测试版补丁 APK
             - Channel: `beta` (b=1)
-            - 触发时间: ${{ github.run_started_at }}
+            - 构建记录: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - 签名验证: V1 / V2 / V3
           files: dist/beta/*.apk
           fail_on_unmatched_files: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || github.token }}
+
+      # 构建及发布均成功后才保存状态，避免失败产物在下次运行时被跳过。
+      - name: Save state after publishing
+        if: ${{ success() && (steps.build.outputs.apk_paths_stable || steps.build.outputs.apk_paths_beta) }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            state.json
+            so_patch/
+          key: apk-state-v2-${{ github.ref }}-${{ github.run_id }}-${{ github.run_attempt }}
