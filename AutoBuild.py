@@ -88,6 +88,9 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------- #
 def _generate_keystore() -> None:
     log("[!] 未找到 keystore，自动生成一个新的")
+    KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
+    # keytool 的 PKCS12 不支持独立私钥密码；JKS 支持两种密码不同。
+    store_type = "PKCS12" if KS_PASS == KEY_PASS else "JKS"
     subprocess.run(
         [
             "keytool", "-genkeypair", "-v",
@@ -96,7 +99,7 @@ def _generate_keystore() -> None:
             "-keyalg", "RSA",
             "-keysize", "2048",
             "-validity", "10000",
-            "-storetype", "PKCS12",
+            "-storetype", store_type,
             "-storepass", KS_PASS,
             "-keypass", KEY_PASS,
             "-dname", "CN=mc-build, OU=dev, O=dev, L=City, ST=State, C=CN",
@@ -143,6 +146,7 @@ def ensure_keystore() -> None:
             raw = base64.b64decode(b64, validate=True)
             if not raw:
                 raise ValueError("内容为空")
+            KEYSTORE.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(raw)
             tmp.replace(KEYSTORE)
         except Exception as e:
@@ -842,24 +846,30 @@ def zipalign_apk(src: Path, dst: Path) -> None:
 
 
 def _verify_required_signatures(apksigner: str, apk: Path) -> dict[str, bool]:
-    """Strictly require V1, V2 and V3 to verify on the final APK."""
-    verify = subprocess.run(
-        [apksigner, "verify", "--verbose", str(apk)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=False,
-    )
-    output = verify.stdout or ""
-    log("[*] apksigner verify:")
-    for line in output.splitlines():
-        if any(k in line for k in (
-            "Verifies", "Verified using v1 scheme", "Verified using v2 scheme",
-            "Verified using v3 scheme", "Verified using v3.1 scheme",
-            "Verified using v3.2 scheme", "Verified using v4 scheme",
-            "Number of signers:",
-        )):
+    """Verify manifest compatibility, then explicitly verify V1, V2 and V3."""
+    # 默认验证可能按 minSdkVersion 跳过 V1/V2，此时 false 不代表签名损坏。
+    # 保留原始兼容性检查，再将验证范围扩展到 API 23，使三种方案都参与验证。
+    # 这里只调整验证范围，不修改 Manifest 或签名时的最低 SDK。
+    output = ""
+    for label, options in (
+        ("Manifest SDK 范围", []),
+        ("V1/V2/V3 完整检查", ["--min-sdk-version", "23"]),
+    ):
+        verify = subprocess.run(
+            [apksigner, "verify", "--verbose", *options, str(apk)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        output = verify.stdout or ""
+        log(f"[*] apksigner verify ({label}):")
+        for line in output.splitlines():
             log(f"    {line}")
+        if verify.returncode != 0:
+            raise RuntimeError(
+                f"apksigner verify 返回失败 ({label}, exit={verify.returncode}): {apk}\n{output}"
+            )
 
     patterns = {
         "v1": r"Verified using v1 scheme .*?:\s*(true|false)",
@@ -872,12 +882,6 @@ def _verify_required_signatures(apksigner: str, apk: Path) -> dict[str, bool]:
         if not m:
             raise RuntimeError(f"apksigner verify 未找到 {scheme} 验证结果: {apk}\n{output}")
         checks[scheme] = m.group(1).lower() == "true"
-
-    if verify.returncode != 0:
-        failed = [k.upper() for k, ok in checks.items() if not ok]
-        raise RuntimeError(
-            f"apksigner verify 返回失败: {apk}; 失败方案={', '.join(failed) or 'unknown'}\n{output}"
-        )
 
     failed = [k.upper() for k, ok in checks.items() if not ok]
     if failed:
