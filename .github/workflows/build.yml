@@ -156,7 +156,7 @@ jobs:
 
       - name: Publish stable
         if: steps.build.outputs.apk_paths_stable
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.build.outputs.release_tag_stable }}
           name: MC Patch (正式版) ${{ steps.build.outputs.release_tag_stable }}
@@ -172,7 +172,7 @@ jobs:
 
       - name: Publish beta
         if: steps.build.outputs.apk_paths_beta
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.build.outputs.release_tag_beta }}
           name: MC Patch (测试版) ${{ steps.build.outputs.release_tag_beta }}
